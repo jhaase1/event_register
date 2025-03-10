@@ -12,11 +12,13 @@ def dwell_until(nominal_time, offset_minutes=0, offset_seconds=0):
     """
     target_time = nominal_time - timedelta(minutes=offset_minutes, seconds=offset_seconds)
     current_time = datetime.now()
+    print(f"Dwelling until {target_time} (current time: {current_time})")
 
     while current_time < target_time:
         time_to_wait = (target_time - current_time).total_seconds()
         time.sleep(min(time_to_wait, 1))  # Sleep in 1-second intervals to allow for quick checks
         current_time = datetime.now()
+    print("Reached the target time.")
 
 def is_within_offset(target_time, offset_minutes=0, offset_seconds=0):
     """
@@ -29,7 +31,9 @@ def is_within_offset(target_time, offset_minutes=0, offset_seconds=0):
     """
     current_time = datetime.now()
     offset = timedelta(minutes=offset_minutes, seconds=offset_seconds)
-    return target_time - offset <= current_time <= target_time
+    within_offset = target_time - offset <= current_time <= target_time
+    print(f"Checking if within offset: {within_offset} (current time: {current_time}, target time: {target_time})")
+    return within_offset
 
 # Example usage:
 # nominal_time = datetime(2023, 10, 10, 15, 0, 0)  # Example nominal time

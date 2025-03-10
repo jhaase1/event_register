@@ -11,44 +11,78 @@ from urllib.parse import urlparse
 
 class Website:
     def __init__(self):
+        print("Initializing the web driver.")
         self.driver = webdriver.Chrome()
+        self.logged_in = False
         self.wait = WebDriverWait(self.driver, timeout=30)
 
     def login(self, website_file="website_token.json"):
         """Logs into the website using the provided credentials."""
+        if self.logged_in:
+            print("Already logged in.")
+            return
+        
+        print("Logging into the website.")
         with open(website_file, "r") as file:
             website_info = json.load(file)
+        print("Website information loaded from file.")
+
+        self.default_registration_time = website_info.get(
+            "default_registration_time", None
+        )
 
         login_url = website_info["login_url"]
         self.website_domain = urlparse(login_url).netloc.lower()
+        print(f"Website domain parsed: {self.website_domain}")
 
         self.driver.get(login_url)
+        print(f"Navigated to login URL: {login_url}")
         self.wait.until(EC.element_to_be_clickable((By.NAME, "email"))).send_keys(
             website_info["email"]
         )
+        print("Entered email.")
         self.wait.until(EC.element_to_be_clickable((By.NAME, "password"))).send_keys(
             website_info["password"]
         )
+        print("Entered password.")
         login_button = self.wait.until(
             EC.element_to_be_clickable(
                 (By.XPATH, "//button[contains(text(), 'Login')]")
             )
         )
         login_button.click()
+        print("Clicked login button.")
         self.wait.until(
             EC.presence_of_element_located(
                 (By.XPATH, "//button[contains(text(), 'Join')]")
             )
         )
 
-    def determine_access_date(self, event_url: str, access_time: datetime = None):
+        print("Successfully logged into the website.")
+        self.logged_in = True
+
+    def determine_access_date(self, event_url: str, registration_time: datetime = None):
         """Determines the access date for the event."""
+        print(f"Determining access date for event: {event_url}")
+        event_domain = urlparse(event_url).netloc.lower()
+        print(f"Event domain parsed: {event_domain}")
+
+        if self.website_domain != event_domain:
+            print("Event domain does not match the website domain.")
+            return None
+
+        if registration_time is None:
+            registration_time = self.default_registration_time
+        print(f"Using registration time: {registration_time}")
+
         self.driver.get(event_url)
+        print(f"Navigated to event URL: {event_url}")
         access_date_element = self.wait.until(
             EC.presence_of_element_located(
                 (By.XPATH, "//h6[contains(text(), 'not joinable')]")
             )
         )
+        print("Access date element found.")
         text = access_date_element.text
 
         date_pattern = r"\b[A-Z][a-z]{2} \d{1,2}\b"
@@ -57,15 +91,17 @@ class Website:
         if match:
             date_str = match.group(0)
             date = datetime.strptime(date_str, "%b %d")
+            print(f"Extracted date string: {date_str}")
 
-            if access_time:
-                access_time = datetime.strptime(access_time, "%H:%M:%S").time()
+            if registration_time:
+                registration_time = datetime.strptime(registration_time, "%H:%M:%S").time()
 
                 date = date.replace(
-                    hour=access_time.hour,
-                    minute=access_time.minute,
-                    second=access_time.second,
+                    hour=registration_time.hour,
+                    minute=registration_time.minute,
+                    second=registration_time.second,
                 )
+                print(f"Registration time set: {registration_time}")
 
             now = datetime.now()
 
@@ -84,21 +120,24 @@ class Website:
 
     def register_for_event(self, event_url: str):
         """Registers for the event."""
-        event_domain = urlparse(event_url).netloc.lower()
-
-        assert self.website_domain == event_domain, "Login URL and event URL must be from the same domain."
-
+        print(f"Registering for the event: {event_url}")
         self.driver.get(event_url)
+        print(f"Navigated to event URL: {event_url}")
         join_button = self.wait.until(
             EC.element_to_be_clickable((By.XPATH, "//button[contains(text(), 'Join')]"))
         )
+        print("Join button found.")
         join_button.click()
+        print("Clicked join button.")
 
         time.sleep(30)
+        print("Successfully registered for the event.")
 
     def close(self):
         """Closes the browser."""
+        print("Closing the web driver.")
         self.driver.quit()
+
 
 # Example usage:
 # interactor = WebsiteInteractor()
