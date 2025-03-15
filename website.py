@@ -11,6 +11,7 @@ from logging_config import get_logger
 
 logger = get_logger(__name__)
 
+
 class Website:
     def __init__(self):
         logger.info("Initializing the web driver.")
@@ -23,7 +24,7 @@ class Website:
         if self.logged_in:
             logger.info("Already logged in.")
             return
-        
+
         logger.info("Logging into the website.")
         with open(website_file, "r") as file:
             website_info = json.load(file)
@@ -96,7 +97,9 @@ class Website:
             logger.debug(f"Extracted date string: {date_str}")
 
             if registration_time:
-                registration_time = datetime.strptime(registration_time, "%H:%M:%S").time()
+                registration_time = datetime.strptime(
+                    registration_time, "%H:%M:%S"
+                ).time()
 
                 date = date.replace(
                     hour=registration_time.hour,

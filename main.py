@@ -7,9 +7,10 @@ from logging_config import get_logger
 
 logger = get_logger(__name__)
 
-HOLD_BUFFER = 10 # minutes
-LOGIN_BUFFER = 1 # minutes
-DELAY = 5 # seconds
+HOLD_BUFFER = 10  # minutes
+LOGIN_BUFFER = 1  # minutes
+DELAY = 5  # seconds
+
 
 def register_for_next_event():
     logger.info("Starting registration process for the next event.")
@@ -25,7 +26,7 @@ def register_for_next_event():
         logger.info("No upcoming events.")
         events.close()
         return
-    
+
     if is_within_offset(registration_time, offset_minutes=HOLD_BUFFER):
         logger.info("Holding until registration time.")
         dwell_until(registration_time, offset_minutes=HOLD_BUFFER)
@@ -33,12 +34,12 @@ def register_for_next_event():
         logger.info("Registration time is too far away.")
         events.close()
         return
-    
+
     website = Website()
 
     logger.info("Logging in to the website.")
     dwell_until(registration_time, offset_minutes=LOGIN_BUFFER)
-    
+
     website.login()
 
     logger.info("Waiting until the exact registration time.")
@@ -51,6 +52,7 @@ def register_for_next_event():
     website.close()
     events.close()
 
+
 def check_for_new_event():
     logger.info("Checking for new events via email.")
     email_client = EmailClient()
@@ -60,7 +62,7 @@ def check_for_new_event():
     if not new_emails:
         logger.info("No new emails found.")
         return
-    
+
     website = Website()
     events = Events()
 
@@ -82,26 +84,36 @@ def check_for_new_event():
             registration_time = website.determine_access_date(event_url)
 
             if registration_time is None:
-                email_client.reply_to_email(email, "I could not determine the registration time.")
+                email_client.reply_to_email(
+                    email, "I could not determine the registration time."
+                )
             else:
-                events.insert_event(event_url=event_url, registration_time=registration_time)
-                email_client.reply_to_email(email, f"I determined I need to register at {registration_time} and will do so.")
-        
+                events.insert_event(
+                    event_url=event_url, registration_time=registration_time
+                )
+                email_client.reply_to_email(
+                    email,
+                    f"I determined I need to register at {registration_time} and will do so.",
+                )
+
         if action == "remove":
             logger.info(f"Removing event: {event_url}")
             events.remove_event(event_url)
-            email_client.reply_to_email(email, "I am not going to register for the event.")
+            email_client.reply_to_email(
+                email, "I am not going to register for the event."
+            )
 
         if action is None:
             logger.info("Could not determine the action from the email.")
             email_client.reply_to_email(email, "I am not sure what you want me to do.")
-        
+
         email_client.mark_email_as_read(email)
         email_client.archive_email(email)
 
     logger.info("Closing website and database connections.")
     website.close()
     events.close()
+
 
 if __name__ == "__main__":
     check_for_new_event()
