@@ -13,7 +13,7 @@ DELAY = 5 # seconds
 
 def register_for_next_event():
     logger.info("Starting registration process for the next event.")
-    logger.debug("Connecting to the database.")
+    # Connect to the database
     events = Events()
     next_event = events.get_next_event_after()
 
@@ -21,7 +21,6 @@ def register_for_next_event():
         event_url = next_event["event_url"]
         registration_time = next_event["registration_time"]
         logger.info(f"Next event found: {event_url} at {registration_time}")
-logger.debug(f"Next event details: {next_event}")
     else:
         logger.info("No upcoming events.")
         events.close()
@@ -54,11 +53,9 @@ logger.debug(f"Next event details: {next_event}")
 
 def check_for_new_event():
     logger.info("Checking for new events via email.")
-logger.debug("Authenticating email client.")
     email_client = EmailClient()
     email_client.authenticate_email()
     new_emails = email_client.read_new_emails()
-logger.debug(f"New emails: {new_emails}")
 
     if not new_emails:
         logger.info("No new emails found.")
@@ -78,7 +75,6 @@ logger.debug(f"New emails: {new_emails}")
             continue
 
         action, event_url = extract_user_intent(email)
-logger.debug(f"Action: {action}, Event URL: {event_url}")
 
         if action == "add":
             logger.info(f"Adding event: {event_url}")
