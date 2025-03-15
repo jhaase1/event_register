@@ -1,5 +1,9 @@
 import time
 from datetime import datetime, timedelta
+from logging_config import get_logger
+
+# Initialize logger
+logger = get_logger(__name__)
 
 def dwell_until(nominal_time, offset_minutes=0, offset_seconds=0):
     """
@@ -12,13 +16,13 @@ def dwell_until(nominal_time, offset_minutes=0, offset_seconds=0):
     """
     target_time = nominal_time - timedelta(minutes=offset_minutes, seconds=offset_seconds)
     current_time = datetime.now()
-    print(f"Dwelling until {target_time} (current time: {current_time})")
+    logger.info(f"Dwelling until {target_time} (current time: {current_time})")
 
     while current_time < target_time:
         time_to_wait = (target_time - current_time).total_seconds()
         time.sleep(min(time_to_wait, 1))  # Sleep in 1-second intervals to allow for quick checks
         current_time = datetime.now()
-    print("Reached the target time.")
+    logger.info("Reached the target time.")
 
 def is_within_offset(target_time, offset_minutes=0, offset_seconds=0):
     """
@@ -32,7 +36,7 @@ def is_within_offset(target_time, offset_minutes=0, offset_seconds=0):
     current_time = datetime.now()
     offset = timedelta(minutes=offset_minutes, seconds=offset_seconds)
     within_offset = target_time - offset <= current_time <= target_time
-    print(f"Checking if within offset: {within_offset} (current time: {current_time}, target time: {target_time})")
+    logger.info(f"Checking if within offset: {within_offset} (current time: {current_time}, target time: {target_time})")
     return within_offset
 
 # Example usage:

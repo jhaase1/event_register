@@ -11,51 +11,59 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
+from logging_config import get_logger
+
 EMAIL_CAPTURE_PATTERN = re.compile(r"^(.*?)?(?:<(.+@.+)>)?$")
+
+# Initialize logger
+logger = get_logger(__name__)
 
 class EmailClient:
     def __init__(self):
-        print("Initializing EmailClient...")
+        logger.info("Initializing EmailClient...")
         self.creds = None
         self.authenticate_email()
         self.whoami()
 
     def authenticate_email(self, token_file="email_token.json"):
         """Shows basic usage of the Gmail API. Lists the user's Gmail labels."""
-        print("Authenticating email...")
+        logger.info("Authenticating email...")
         SCOPES = [
             "https://www.googleapis.com/auth/gmail.readonly",
             "https://www.googleapis.com/auth/gmail.modify",
             "https://www.googleapis.com/auth/contacts.readonly",
         ]
+        logger.debug(f"Scopes: {SCOPES}")
 
         if os.path.exists(token_file):
-            print(f"Loading credentials from {token_file}...")
+            logger.info(f"Loading credentials from {token_file}...")
             self.creds = Credentials.from_authorized_user_file(token_file, SCOPES)
         if not self.creds or not self.creds.valid:
             if self.creds and self.creds.expired and self.creds.refresh_token:
-                print("Refreshing expired credentials...")
+                logger.info("Refreshing expired credentials...")
                 self.creds.refresh(Request())
             else:
-                print("Fetching new credentials...")
+                logger.info("Fetching new credentials...")
                 flow = InstalledAppFlow.from_client_secrets_file(
                     "credentials.json", SCOPES
                 )
                 self.creds = flow.run_local_server(port=0)
             with open(token_file, "w") as token:
                 token.write(self.creds.to_json())
-                print(f"Credentials saved to {token_file}.")
+                logger.debug(f"Credentials saved to {token_file}.")
 
     def whoami(self):
         """Returns the email address of the authenticated user."""
-        print("Fetching authenticated user's email address...")
+        logger.info("Fetching authenticated user's email address...")
         service = build('gmail', 'v1', credentials=self.creds)
         self.user = service.users().getProfile(userId='me').execute().get('emailAddress')
-        print(f"Authenticated as {self.user}")
+        logger.info(f"Authenticated as {self.user}")
+        logger.debug(f"Authenticated user email: {self.user}")
 
     def is_sender_authorized(self, sender_email, auth_label="Scheduler"):
         """Checks if the sender is a contact with the label 'Scheduler'."""
-        print(f"Checking if sender {sender_email} is authorized...")
+        logger.info(f"Checking if sender {sender_email} is authorized...")
+        logger.debug(f"Sender email: {sender_email}")
         if not self.creds:
             self.authenticate_email()
 
@@ -78,18 +86,19 @@ class EmailClient:
                 for email_object in email_addresses:
                     email = email_object.get("value", "")
                     if email.lower() == sender_email.lower():
-                        print(f"Sender {sender_email} is authorized.")
+                        logger.info(f"Sender {sender_email} is authorized.")
                         return True
-            print(f"Sender {sender_email} is not authorized.")
+            logger.info(f"Sender {sender_email} is not authorized.")
             return False
 
         except HttpError as error:
-            print(f"An error occurred: {error}")
+            logger.info(f"An error occurred: {error}")
             return False
 
     def read_new_emails(self, raw_email=False):
         """Reads new unread emails from the user's Gmail inbox."""
-        print("Reading new unread emails...")
+        logger.info("Reading new unread emails...")
+        logger.debug(f"Raw email flag: {raw_email}")
         if not self.creds:
             self.authenticate_email()
 
@@ -104,7 +113,7 @@ class EmailClient:
             messages = results.get("messages", [])
 
             if not messages:
-                print("No new emails found.")
+                logger.info("No new emails found.")
                 return
            
             msgs = []
@@ -155,15 +164,17 @@ class EmailClient:
                 )
                 msgs.append(msg_namespace)
 
-            print(f"Found {len(msgs)} new emails.")
+            logger.info(f"Found {len(msgs)} new emails.")
+            logger.debug(f"Email details: {msgs}")
             return msgs
 
         except HttpError as error:
-            print(f"An error occurred: {error}")
+            logger.info(f"An error occurred: {error}")
 
     def mark_email_as_read(self, email):
         """Marks an email as read."""
-        print(f"Marking email with ID {email.id} as read...")
+        logger.info(f"Marking email with ID {email.id} as read...")
+        logger.debug(f"Email ID: {email.id}")
         if not self.creds:
             self.authenticate_email()
 
@@ -172,14 +183,15 @@ class EmailClient:
             service.users().messages().modify(
                 userId="me", id=email.id, body={"removeLabelIds": ["UNREAD"]}
             ).execute()
-            print(f"Email with ID {email.id} marked as read.")
+            logger.info(f"Email with ID {email.id} marked as read.")
 
         except HttpError as error:
-            print(f"An error occurred: {error}")
+            logger.info(f"An error occurred: {error}")
 
     def archive_email(self, email):
         """Archives an email."""
-        print(f"Archiving email with ID {email.id}...")
+        logger.info(f"Archiving email with ID {email.id}...")
+        logger.debug(f"Email ID: {email.id}")
         if not self.creds:
             self.authenticate_email()
 
@@ -188,28 +200,30 @@ class EmailClient:
             service.users().messages().modify(
                 userId="me", id=email.id, body={"removeLabelIds": ["INBOX"]}
             ).execute()
-            print(f"Email with ID {email.id} archived.")
+            logger.info(f"Email with ID {email.id} archived.")
 
         except HttpError as error:
-            print(f"An error occurred: {error}")
+            logger.info(f"An error occurred: {error}")
 
     def delete_email(self, email):
         """Deletes an email."""
-        print(f"Deleting email with ID {email.id}...")
+        logger.info(f"Deleting email with ID {email.id}...")
+        logger.debug(f"Email ID: {email.id}")
         if not self.creds:
             self.authenticate_email()
 
         try:
             service = build("gmail", "v1", credentials=self.creds)
             service.users().messages().delete(userId="me", id=email.id).execute()
-            print(f"Email with ID {email.id} deleted.")
+            logger.info(f"Email with ID {email.id} deleted.")
 
         except HttpError as error:
-            print(f"An error occurred: {error}")
+            logger.info(f"An error occurred: {error}")
 
     def reply_to_email(self, email, reply):
         """Replies to an email."""
-        print(f"Replying to email with ID {email.id}...")
+        logger.info(f"Replying to email with ID {email.id}...")
+        logger.debug(f"Reply content: {reply}")
         if not self.creds:
             self.authenticate_email()
 
@@ -240,10 +254,10 @@ class EmailClient:
                 .execute()
             )
 
-            print(f"Replied to email with ID {email.id}.")
+            logger.info(f"Replied to email with ID {email.id}.")
             return send_message
         except HttpError as error:
-            print(f"An error occurred: {error}")
+            logger.info(f"An error occurred: {error}")
 
     @staticmethod
     def extract_email_address(emails):
