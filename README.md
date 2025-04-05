@@ -65,3 +65,12 @@ if __name__ == "__main__":
 ## License
 
 This project is licensed under the MIT License.
+
+# Privacy policy
+Privacy Policy
+
+Last Updated: 2025-03-18
+
+Welcome to Event Register. Your privacy is important to us. This Privacy Policy outlines the collection and use of your data in our app. Because this is a personal project I make no guarantees to data security. Use at your own risk. This app uses the GMail API and therefore requires you to authorize it's use.
+
+If you have a concern please submit a GitHub issue. https://github.com/jhaase1/event_register/issues
