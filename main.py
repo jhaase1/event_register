@@ -88,9 +88,19 @@ def check_for_new_event():
                     email, "I could not determine the registration time."
                 )
             else:
+                old_urls = events.get_event_urls_by_date(registration_time)
+                if old_urls:
+                    logger.info(
+                        f"Event already exists for this date: {old_urls}. Removing old event."
+                    )
+
+                    for old_url in old_urls:
+                        events.remove_event(old_url)
+                
                 events.insert_event(
                     event_url=event_url, registration_time=registration_time
                 )
+                
                 email_client.reply_to_email(
                     email,
                     f"I determined I need to register at {registration_time} and will do so.",
