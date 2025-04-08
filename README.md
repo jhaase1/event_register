@@ -15,7 +15,7 @@ This project automates the process of registering for events on a specified webs
 
 1. **Install Dependencies**:
     ```sh
-    pip install selenium google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client
+    pip install selenium google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client tabulate
     ```
 
 2. **Download WebDriver**:

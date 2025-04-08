@@ -1,3 +1,4 @@
+from tabulate import tabulate
 from events import Events
 from website import Website
 from dwell import dwell_until, is_within_offset
@@ -9,8 +10,9 @@ logger = get_logger(__name__)
 
 HOLD_BUFFER = 10  # minutes
 LOGIN_BUFFER = 1  # minutes
-DELAY = 5  # seconds
+DELAY = 3.75  # seconds
 
+cleanup_days = 14  # days to keep events in the database
 
 def register_for_next_event():
     logger.info("Starting registration process for the next event.")
@@ -50,6 +52,9 @@ def register_for_next_event():
 
     logger.info("Closing website and database connections.")
     website.close()
+
+    logger.info("Removing old events from the database.")
+    events.remove_old_events(n_days=cleanup_days)
     events.close()
 
 
@@ -78,16 +83,25 @@ def check_for_new_event():
 
         action, event_url = extract_user_intent(email)
 
-        if action == "add":
+        if action == "report":
+            logger.info("Reporting the event.")
+            event_list = events.list_all_events()
+            email_client.reply_to_email(
+                email, tabulate(event_list, headers=["event url", "registration time"], tablefmt="html")
+            )
+        
+        elif action == "add":
             logger.info(f"Adding event: {event_url}")
             website.login()
             registration_time = website.determine_access_date(event_url)
 
             if registration_time is None:
+                logger.info(f"Could not determine the registration time for {event_url}.")
                 email_client.reply_to_email(
                     email, "I could not determine the registration time."
                 )
             else:
+                logger.debug(f"Inserting {event_url} into database at {registration_time}")
                 old_urls = events.get_event_urls_by_date(registration_time)
                 if old_urls:
                     logger.info(
@@ -96,24 +110,23 @@ def check_for_new_event():
 
                     for old_url in old_urls:
                         events.remove_event(old_url)
-                
                 events.insert_event(
                     event_url=event_url, registration_time=registration_time
                 )
-                
                 email_client.reply_to_email(
                     email,
                     f"I determined I need to register at {registration_time} and will do so.",
                 )
+                logger.info(f"Inserted and emailed {event_url} into database at {registration_time}")
 
-        if action == "remove":
+        elif action == "remove":
             logger.info(f"Removing event: {event_url}")
             events.remove_event(event_url)
             email_client.reply_to_email(
                 email, "I am not going to register for the event."
             )
 
-        if action is None:
+        elif action is None:
             logger.info("Could not determine the action from the email.")
             email_client.reply_to_email(email, "I am not sure what you want me to do.")
 
@@ -126,5 +139,10 @@ def check_for_new_event():
 
 
 if __name__ == "__main__":
-    check_for_new_event()
+    try:
+        check_for_new_event()
+    except:
+        pass
+    
     register_for_next_event()
+
