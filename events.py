@@ -95,12 +95,7 @@ class Events:
             """
         )
         rows = self.cursor.fetchall()
-        events = []
-        for row in rows:
-            # Convert the registration_time to a datetime object.
-            registration_time = datetime.strptime(row[1], "%Y-%m-%d %H:%M:%S")
-            events.append({"event_url": row[0], "registration_time": registration_time})
-        return events
+        return rows
 
     def close(self):
         self.conn.close()
