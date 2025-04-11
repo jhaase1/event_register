@@ -57,4 +57,3 @@ def find_urls(text):
     """
     url_pattern = re.compile(r'https?://(?:www\.)?[a-zA-Z0-9./-]+')
     return url_pattern.findall(text)
-    
