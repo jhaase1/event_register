@@ -10,6 +10,7 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from google.auth.exceptions import RefreshError
 
 from logging_config import get_logger
 
@@ -37,12 +38,23 @@ class EmailClient:
 
         if os.path.exists(token_file):
             logger.info(f"Loading credentials from {token_file}...")
-            self.creds = Credentials.from_authorized_user_file(token_file, SCOPES)
+            try:
+                self.creds = Credentials.from_authorized_user_file(token_file, SCOPES)
+            except RefreshError:
+                logger.warning("Token is invalid or revoked. Deleting token file and reauthenticating...")
+                os.remove(token_file)
+                self.creds = None
+
         if not self.creds or not self.creds.valid:
             if self.creds and self.creds.expired and self.creds.refresh_token:
-                logger.info("Refreshing expired credentials...")
-                self.creds.refresh(Request())
-            else:
+                try:
+                    logger.info("Refreshing expired credentials...")
+                    self.creds.refresh(Request())
+                except RefreshError:
+                    logger.warning("Failed to refresh credentials. Deleting token file and reauthenticating...")
+                    os.remove(token_file)
+                    self.creds = None
+            if not self.creds:
                 logger.info("Fetching new credentials...")
                 flow = InstalledAppFlow.from_client_secrets_file(
                     "credentials.json", SCOPES
