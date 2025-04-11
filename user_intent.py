@@ -22,6 +22,10 @@ def extract_user_intent(email, assumed_action="add"):
 
     corpus = email.subject + "\n" + email.body
 
+    if corpus.lower().startswith("report"):
+        logger.info("Detected action: report")
+        return "report", None
+
     # Extract the URLs from the email
     urls = find_urls(email.subject + "\n" + email.body)
         
@@ -33,7 +37,7 @@ def extract_user_intent(email, assumed_action="add"):
         logger.info("No URLs found in the email.")
         return None, None
         
-    if "stop" in corpus.lower() or "cancel" in corpus.lower():
+    if "stop" in corpus.lower() or "cancel" in corpus.lower() or "remove" in corpus.lower():
         action = "remove"
         logger.info("Detected action: remove")
     else:

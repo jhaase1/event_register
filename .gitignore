@@ -2,3 +2,5 @@
 *.db
 *.ipynb
 *.pyc
+logs/
+.venv/

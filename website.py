@@ -1,7 +1,11 @@
 from selenium import webdriver
+from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.wait import WebDriverWait
 import selenium.webdriver.support.expected_conditions as EC
+
+from selenium.webdriver.chrome.options import Options
+
 import re
 from datetime import datetime
 import time
@@ -15,7 +19,13 @@ logger = get_logger(__name__)
 class Website:
     def __init__(self):
         logger.info("Initializing the web driver.")
-        self.driver = webdriver.Chrome()
+        
+        options = Options()
+        options.headless = True
+
+
+        service = ChromeService(executable_path='/usr/bin/chromedriver')
+        self.driver = webdriver.Chrome(service=service, options=options)
         self.logged_in = False
         self.wait = WebDriverWait(self.driver, timeout=30)
 
@@ -116,7 +126,7 @@ class Website:
             else:
                 date = date.replace(year=now.year)
 
-            logger.debug(f"Extracted date: {date}")
+            logger.info(f"Extracted date: {date}")
         else:
             logger.info("No date found in the text.")
             date = None

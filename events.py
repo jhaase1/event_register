@@ -1,6 +1,5 @@
 import sqlite3
-from datetime import datetime
-
+from datetime import datetime, timedelta
 
 class Events:
     def __init__(self, db_name="events.db"):
@@ -74,6 +73,29 @@ class Events:
             (event_url,),
         )
         self.conn.commit()
+
+    def remove_old_events(self, n_days):
+        """Removes events with a registration_time older than n_days days ago."""
+        cutoff = datetime.now() - timedelta(days=n_days)
+        cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
+        self.cursor.execute(
+            """
+            DELETE FROM events WHERE registration_time < ?
+            """,
+            (cutoff_str,),
+        )
+        self.conn.commit()
+
+    def list_all_events(self):
+        """Returns all rows ordered by descending registration_time."""
+        self.cursor.execute(
+            """
+            SELECT event_url, registration_time FROM events 
+            ORDER BY registration_time DESC
+            """
+        )
+        rows = self.cursor.fetchall()
+        return rows
 
     def close(self):
         self.conn.close()
