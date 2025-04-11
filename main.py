@@ -1,3 +1,4 @@
+import textile
 from tabulate import tabulate
 from events import Events
 from website import Website
@@ -86,14 +87,20 @@ def check_for_new_event():
         if action == "report":
             logger.info("Reporting the event.")
             event_list = events.list_all_events()
+
+            headers = ["event url", "registration time", "additional info"]
+            reply = tabulate(event_list, headers=headers)
+            reply_html = tabulate(reply, tablefmt="html", headers=headers)
+
             email_client.reply_to_email(
-                email, tabulate(event_list, headers=["event url", "registration time"], tablefmt="html")
+                email, 
+                reply_plaintext=reply, reply_html=reply_html
             )
         
         elif action == "add":
             logger.info(f"Adding event: {event_url}")
             website.login()
-            registration_time = website.determine_access_date(event_url)
+            registration_time, additional_info = website.determine_access_date(event_url)
 
             if registration_time is None:
                 logger.info(f"Could not determine the registration time for {event_url}.")
@@ -111,13 +118,24 @@ def check_for_new_event():
                     for old_url in old_urls:
                         events.remove_event(old_url)
                 events.insert_event(
-                    event_url=event_url, registration_time=registration_time
+                    event_url=event_url, registration_time=registration_time, additional_info=additional_info
                 )
+
+                reply = f"I determined I need to register at {registration_time} and will do so."
+
+                if additional_info:
+                    reply += "\n\nAdditional info: {additional_info}"
+                
+
+                reply_html = textile.textile(reply)
+                
                 email_client.reply_to_email(
                     email,
-                    f"I determined I need to register at {registration_time} and will do so.",
+                    reply_plaintext=reply,
+                    reply_html=reply_html,
                 )
-                logger.info(f"Inserted and emailed {event_url} into database at {registration_time}")
+
+                logger.info(f"Inserted and emailed {event_url} into database at {registration_time} with additional info: {additional_info}")
 
         elif action == "remove":
             logger.info(f"Removing event: {event_url}")

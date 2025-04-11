@@ -86,10 +86,10 @@ class Website:
             )
         )
         logger.info("Access date element found.")
-        text = access_date_element.text
+        join_date_text = access_date_element.text
 
         date_pattern = r"\b[A-Z][a-z]{2} \d{1,2}\b"
-        match = re.search(date_pattern, text)
+        match = re.search(date_pattern, join_date_text)
 
         if match:
             date_str = match.group(0)
@@ -121,7 +121,24 @@ class Website:
             logger.info("No date found in the text.")
             date = None
 
-        return date
+        try:
+            # extract additional information from the page
+            # Use XPath to select all sibling elements that come after the header in the body.
+            content_elements = self.driver.find_elements(By.XPATH, "//header/following-sibling::*")
+
+            # Dive until we're out of the nested elements
+            for _ in range(10):
+                if len(content_elements) == 1:
+                    content_elements = content_elements[0].find_elements(By.XPATH, "./*")
+                else:
+                    break
+
+            # Gather the text content of the remaining first element
+            body_content = content_elements[0].text.replace("\n", " - ")
+        except:
+            body_content = ""
+
+        return date, body_content
 
     def register_for_event(self, event_url: str):
         """Registers for the event."""

@@ -232,10 +232,10 @@ class EmailClient:
         except HttpError as error:
             logger.info(f"An error occurred: {error}")
 
-    def reply_to_email(self, email, reply):
+    def reply_to_email(self, email, reply_plaintext, reply_html=None):
         """Replies to an email."""
         logger.info(f"Replying to email with ID {email.id}...")
-        logger.debug(f"Reply content: {reply}")
+        logger.debug(f"Reply content: {reply_plaintext}")
         if not self.creds:
             self.authenticate_email()
 
@@ -243,7 +243,11 @@ class EmailClient:
             service = build("gmail", "v1", credentials=self.creds)
 
             message = EmailMessage()
-            message.set_content(reply)
+            message.set_content(reply_plaintext)
+
+            if reply_html:
+                message.add_alternative(reply_html, subtype="html")
+
 
             me = self.user
 
