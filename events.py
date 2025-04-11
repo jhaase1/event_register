@@ -13,19 +13,20 @@ class Events:
             """
             CREATE TABLE IF NOT EXISTS events (
                 event_url TEXT PRIMARY KEY,
-                registration_time TIMESTAMP NOT NULL
+                registration_time TIMESTAMP NOT NULL,
+                additional_info TEXT
             )
         """
         )
 
-    def insert_event(self, event_url, registration_time):
+    def insert_event(self, event_url, registration_time, additional_info=""):
         try:
             self.cursor.execute(
                 """
-                INSERT INTO events (event_url, registration_time)
-                VALUES (?, ?)
+                INSERT INTO events (event_url, registration_time, additional_info)
+                VALUES (?, ?, ?)
             """,
-                (event_url, registration_time),
+                (event_url, registration_time, additional_info),
             )
             self.conn.commit()
         except sqlite3.IntegrityError:
@@ -90,7 +91,7 @@ class Events:
         """Returns all rows ordered by descending registration_time."""
         self.cursor.execute(
             """
-            SELECT event_url, registration_time FROM events 
+            SELECT event_url, registration_time, additional_info FROM events 
             ORDER BY registration_time DESC
             """
         )
