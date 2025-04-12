@@ -1,5 +1,8 @@
 import sqlite3
 from datetime import datetime, timedelta
+from logging_config import get_logger
+
+logger = get_logger(__name__)
 
 class Events:
     def __init__(self, db_name="events.db"):
@@ -67,6 +70,8 @@ class Events:
 
     def remove_event(self, event_url):
         """Removes a row based on the event_url."""
+        logger.info(f"Removing event: {event_url}")
+
         self.cursor.execute(
             """
             DELETE FROM events WHERE event_url = ?

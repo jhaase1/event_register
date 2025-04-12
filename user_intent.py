@@ -2,6 +2,7 @@ import re
 from logging_config import get_logger
 
 logger = get_logger(__name__)
+logger.setLevel("DEBUG")
 
 def extract_user_intent(email, assumed_action="add"):
     """
@@ -22,7 +23,9 @@ def extract_user_intent(email, assumed_action="add"):
 
     corpus = email.subject + "\n" + email.body
 
-    if corpus.lower().startswith("report"):
+    logger.debug(f"Corpus: {corpus}")
+
+    if "report" in email.subject.lower():
         logger.info("Detected action: report")
         return "report", None
 
