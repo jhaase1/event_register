@@ -19,7 +19,7 @@ HOLD_BUFFER = 10  # minutes
 LOGIN_BUFFER = 1  # minutes
 DELAY = 3.75  # seconds
 
-cleanup_days = 14  # days to keep events in the database
+cleanup_days = 8  # days to keep events in the database
 
 def register_for_next_event(headless=True):
     logger.info("Starting registration process for the next event.")
