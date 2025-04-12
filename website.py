@@ -14,24 +14,26 @@ from urllib.parse import urlparse
 from logging_config import get_logger
 
 logger = get_logger(__name__)
+logger.setLevel("DEBUG")
 
 
 class Website:
     def __init__(self, headless=True):
         logger.info("Initializing the web driver.")
         
-        options = Options()
-        options.headless = headless
-
         if headless:
-            executable_path='/usr/bin/chromedriver'
-        else:
-            executable_path=None
+            service = ChromeService(executable_path='/usr/bin/chromedriver')
+            options = Options()
+            options.headless = headless
 
-        service = ChromeService(executable_path=executable_path)
-        self.driver = webdriver.Chrome(service=service, options=options)
+            self.driver = webdriver.Chrome(service=service, options=options)
+        else:
+            self.driver = webdriver.Chrome()
+
         self.logged_in = False
+
         self.wait = WebDriverWait(self.driver, timeout=30)
+        logger.info("Web driver initialized.")
 
     def login(self, website_file="website_token.json"):
         """Logs into the website using the provided credentials."""
@@ -86,7 +88,7 @@ class Website:
 
         if self.website_domain != event_domain:
             logger.info("Event domain does not match the website domain.")
-            return None
+            return None, None
 
         if registration_time is None:
             registration_time = self.default_registration_time
@@ -139,16 +141,23 @@ class Website:
             # extract additional information from the page
             # Use XPath to select all sibling elements that come after the header in the body.
             content_elements = self.driver.find_elements(By.XPATH, "//header/following-sibling::*")
+            logger.debug(f"Found {len(content_elements)} elements with XPath '//header/following-sibling::*'.")
 
             # Dive until we're out of the nested elements
-            for _ in range(10):
+            for i in range(10):
+                logger.debug(f"Iteration {i}: content_elements count = {len(content_elements)}")
                 if len(content_elements) == 1:
                     content_elements = content_elements[0].find_elements(By.XPATH, "./*")
                 else:
                     break
 
             # Gather the text content of the remaining first element
-            body_content = content_elements[0].text.replace("\n", " - ")
+            if content_elements:
+                body_content = content_elements[0].text.replace("\n", " - ")
+                logger.debug(f"Final body content: {body_content}")
+            else:
+                logger.debug("No nested content elements found.")
+                body_content = ""
         except:
             body_content = ""
 

@@ -6,6 +6,12 @@ from dwell import dwell_until, is_within_offset
 from email_client import EmailClient
 from user_intent import extract_user_intent
 from logging_config import get_logger
+import os
+
+if os.name == 'nt':
+    headless = False
+elif os.name == 'posix':
+    headless = True
 
 logger = get_logger(__name__)
 
@@ -15,7 +21,7 @@ DELAY = 3.75  # seconds
 
 cleanup_days = 14  # days to keep events in the database
 
-def register_for_next_event():
+def register_for_next_event(headless=True):
     logger.info("Starting registration process for the next event.")
     # Connect to the database
     events = Events()
@@ -38,7 +44,7 @@ def register_for_next_event():
         events.close()
         return
 
-    website = Website()
+    website = Website(headless=headless)
 
     logger.info("Logging in to the website.")
     dwell_until(registration_time, offset_minutes=LOGIN_BUFFER)
@@ -59,7 +65,7 @@ def register_for_next_event():
     events.close()
 
 
-def check_for_new_event():
+def check_for_new_event(headless=True):
     logger.info("Checking for new events via email.")
     email_client = EmailClient()
     email_client.authenticate_email()
@@ -69,7 +75,7 @@ def check_for_new_event():
         logger.info("No new emails found.")
         return
 
-    website = Website()
+    website = Website(headless=headless)
     events = Events()
 
     for email in new_emails:
@@ -90,7 +96,7 @@ def check_for_new_event():
 
             headers = ["event url", "registration time", "additional info"]
             reply = tabulate(event_list, headers=headers)
-            reply_html = tabulate(reply, tablefmt="html", headers=headers)
+            reply_html = tabulate(event_list, headers=headers, tablefmt="html")
 
             email_client.reply_to_email(
                 email, 
@@ -124,7 +130,7 @@ def check_for_new_event():
                 reply = f"I determined I need to register at {registration_time} and will do so."
 
                 if additional_info:
-                    reply += "\n\nAdditional info: {additional_info}"
+                    reply += f"\n\nAdditional info: {additional_info}"
                 
 
                 reply_html = textile.textile(reply)
@@ -157,9 +163,11 @@ def check_for_new_event():
 
 
 if __name__ == "__main__":
-    try:
-        check_for_new_event()
-    except:
-        pass
+
     
-    register_for_next_event()
+    try:
+        check_for_new_event(headless=headless)
+    except Exception as e:
+        logger.error(f"An error occurred: {e}")
+    
+    register_for_next_event(headless=headless)
