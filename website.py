@@ -17,14 +17,18 @@ logger = get_logger(__name__)
 
 
 class Website:
-    def __init__(self):
+    def __init__(self, headless=True):
         logger.info("Initializing the web driver.")
         
         options = Options()
-        options.headless = True
+        options.headless = headless
 
+        if headless:
+            executable_path='/usr/bin/chromedriver'
+        else:
+            executable_path=None
 
-        service = ChromeService(executable_path='/usr/bin/chromedriver')
+        service = ChromeService(executable_path=executable_path)
         self.driver = webdriver.Chrome(service=service, options=options)
         self.logged_in = False
         self.wait = WebDriverWait(self.driver, timeout=30)
