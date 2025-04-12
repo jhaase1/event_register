@@ -2,6 +2,9 @@ import logging
 from datetime import datetime
 import os
 
+current_directory = os.path.dirname(os.path.abspath(__file__))
+os.chdir(current_directory)
+
 # Ensure the logs directory exists
 os.makedirs("logs", exist_ok=True)
 
