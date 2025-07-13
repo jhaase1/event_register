@@ -232,7 +232,7 @@ class EmailClient:
         except HttpError as error:
             logger.info(f"An error occurred: {error}")
 
-    def reply_to_email(self, email, reply_plaintext, reply_html=None):
+    def reply_to_email(self, email, reply_plaintext, reply_html=None, subject=None):
         """Replies to an email."""
         logger.info(f"Replying to email with ID {email.id}...")
         logger.debug(f"Reply content: {reply_plaintext}")
@@ -254,7 +254,7 @@ class EmailClient:
             message['To'] = ", ".join([address for address in email.To + email.From if address != me])
             message['From'] = me
             message['Cc'] = ", ".join(email.Cc)
-            message['Subject'] = email.subject
+            message['Subject'] = subject or email.subject
             message['References'] = email.message_id
             message['In-Reply-To'] = email.message_id
 

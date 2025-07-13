@@ -149,6 +149,7 @@ def check_for_new_event(headless=True):
                     email,
                     reply_plaintext=reply,
                     reply_html=reply_html,
+                    subject=f"Event Registration Confirmation: {event_date} {time_range}",
                 )
 
                 logger.info(
@@ -159,7 +160,8 @@ def check_for_new_event(headless=True):
             logger.info(f"Removing event: {event_date, time_range}")
             events.remove_event(event_date, time_range)
             email_client.reply_to_email(
-                email, "I am not going to register for the event."
+                email, "I am not going to register for the event.",
+                subject=f"Event Registration Cancellation: {event_date} {time_range}"
             )
 
         elif action is None:
