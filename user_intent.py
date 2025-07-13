@@ -19,7 +19,7 @@ def extract_user_intent(email, assumed_action="add"):
     logger.debug(f"Email body: {email.body}")
     action = assumed_action
     
-    event_url = None
+    event_details = None
 
     corpus = email.subject + "\n" + email.body
 
@@ -29,34 +29,42 @@ def extract_user_intent(email, assumed_action="add"):
         logger.info("Detected action: report")
         return "report", None
 
-    # Extract the URLs from the email
-    urls = find_urls(email.subject + "\n" + email.body)
-        
-    # assume the first URL is the event URL
-    if urls:
-        event_url = urls[0]
-        logger.info(f"Found event URL: {event_url}")
+    # Extract the event details from the email
+    event_details = extract_event_details(corpus)
+
+    if event_details:
+        date, time_range = event_details
+        logger.info(f"Found event date: {date}, time range: {time_range}")
     else:
-        logger.info("No URLs found in the email.")
+        logger.info("No event details found in the email.")
         return None, None
-        
+    
     if "stop" in corpus.lower() or "cancel" in corpus.lower() or "remove" in corpus.lower():
         action = "remove"
         logger.info("Detected action: remove")
     else:
         logger.info("Detected action: add")
 
-    return action, event_url
+    return action, event_details
 
-def find_urls(text):
+def extract_event_details(text):
     """
-    Finds all URLs in a given string.
+    Finds a date and a range of times in a given string.
 
     Args:
-    text: The string to search for URLs in.
+    text: The string to search for the date and time range in.
 
     Returns:
-    A list of URLs found in the string.
+    A tuple containing the date and the time range if found, otherwise None.
     """
-    url_pattern = re.compile(r'https?://(?:www\.)?[a-zA-Z0-9./-]+')
-    return url_pattern.findall(text)
+    # Regex pattern to match the date and time range format
+    pattern = re.compile(r'(?P<date>\b[A-Z]{3},\s[A-Z]{3,9}\s\d{1,2}\b)\s+(?P<time_range>\d{1,2}:\d{2}(?:[ap]m)?\s-\s\d{1,2}:\d{2}(?:[ap]m)?)')
+    match = pattern.search(text)
+
+    if match:
+        date = match.group('date').strip()
+        time_range = match.group('time_range').strip()
+        logger.debug(f"Extracted date: {date}, time range: {time_range}")
+        return date, time_range
+
+    return None

@@ -16,13 +16,22 @@ from logging_config import get_logger
 logger = get_logger(__name__)
 logger.setLevel("DEBUG")
 
+DATE_BOX = ".css-5j348m"
+EVENT_BOX = "css-dik0t"
+EXTRA_CONTENT_BOX = ".MuiGrid-root.MuiGrid-container.MuiGrid-wrap-xs-nowrap.css-a2e4ud"
+
 
 class Website:
-    def __init__(self, headless=True):
+    def __init__(self, headless=True, wait_time=30):
+        """ Initializes the web driver for the website interaction.
+        Args:
+            headless (bool): Whether to run the browser in headless mode.
+            wait_time (int): The maximum wait time for elements to load.
+        """
         logger.info("Initializing the web driver.")
-        
+
         if headless:
-            service = ChromeService(executable_path='/usr/bin/chromedriver')
+            service = ChromeService(executable_path="/usr/bin/chromedriver")
             options = Options()
             options.headless = headless
 
@@ -32,7 +41,8 @@ class Website:
 
         self.logged_in = False
 
-        self.wait = WebDriverWait(self.driver, timeout=30)
+        self.wait_time = wait_time
+        self.wait = WebDriverWait(self.driver, timeout=self.wait_time)
         logger.info("Web driver initialized.")
 
     def login(self, website_file="website_token.json"):
@@ -53,6 +63,8 @@ class Website:
         login_url = website_info["login_url"]
         self.website_domain = urlparse(login_url).netloc.lower()
         logger.debug(f"Website domain parsed: {self.website_domain}")
+
+        self.events_url = website_info["events_url"]
 
         self.driver.get(login_url)
         logger.debug(f"Navigated to login URL: {login_url}")
@@ -80,27 +92,104 @@ class Website:
         logger.info("Successfully logged into the website.")
         self.logged_in = True
 
-    def determine_access_date(self, event_url: str, registration_time: datetime = None):
-        """Determines the access date for the event."""
-        logger.info(f"Determining access date for event: {event_url}")
-        event_domain = urlparse(event_url).netloc.lower()
-        logger.debug(f"Event domain parsed: {event_domain}")
+    def _go_to_events_page(self):
+        """Navigates to the events page."""
+        logger.info(f"Navigating to events page: {self.events_url}")
+        self.driver.get(self.events_url)
+        logger.debug(f"Events page loaded: {self.events_url}")
 
-        if self.website_domain != event_domain:
-            logger.info("Event domain does not match the website domain.")
-            return None, None
+        # Wait for the events to load
+        self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, DATE_BOX)))
+
+    def display_all_events(self):
+        """
+        Continuously clicks the "Load more" button on the events page until all events are loaded.
+        This method counts the number of currently loaded event elements and clicks the "Load more" button
+        as long as new events are being loaded. It waits for the "Load more" button to appear, clicks it,
+        and repeats the process until no more new events are loaded.
+        Raises:
+            AssertionError: If the "Load more" button cannot be found.
+        """
+
+        # Ensure we are on the events page
+        self._go_to_events_page()
+
+        num_days_loaded = 0
+
+        while num_days_loaded < (
+            num_days_loaded := len(self.driver.find_elements(By.CSS_SELECTOR, DATE_BOX))
+        ):
+            logger.debug(f"clicking load more {num_days_loaded = }")
+
+            try:
+                load_more_button = self.wait.until(
+                    EC.presence_of_element_located(
+                        (By.XPATH, "//button[text()='Load more']")
+                    )
+                )
+                logger.debug("Load more button found.")
+            except Exception as e:
+                logger.error("Button not found within 10 seconds:", e)
+                raise AssertionError("Load more button not found")
+
+            load_more_button.click()
+            logger.debug("Clicked load more button.")
+
+        logger.info("All events displayed.")
+
+    def _find_event(self, event_date: str, time_range: str):
+        """
+        Finds an event based on the provided date and time range.
+        This method searches for an event that matches the specified date and time range and returns its parent element.
+        Args:
+            event_date (str): The date string to search for in the event elements.
+            time_range (str): The time range string to search for in the event elements.
+        Returns:
+            WebElement: The parent element of the found event.
+        Raises:
+            AssertionError: If no matching event is found.
+        """
+
+        date_time_elements = self.wait.until(
+            EC.presence_of_element_located(
+                (
+                    By.XPATH,
+                    f"//h6[contains(text(), '{event_date}')]/following-sibling::h6[contains(text(), '{time_range}')]",
+                )
+            )
+        )
+        logger.debug(f"Event date and time elements found: {date_time_elements}")
+
+        event = date_time_elements.find_element(
+            By.XPATH,
+            f"./ancestor::*[contains(@class, 'MuiCardContent-root') and contains(@class, '{EVENT_BOX}')]",
+        )
+        logger.debug(f"Parent element found: {event}")
+
+        return event
+
+    def determine_access_date(
+        self, event_date: str, time_range: str, registration_time: datetime = None
+    ):
+        """Determines the access date for the event."""
+        logger.info(f"Determining access date for event: {event_date}, {time_range}")
 
         if registration_time is None:
             registration_time = self.default_registration_time
         logger.debug(f"Using registration time: {registration_time}")
 
-        self.driver.get(event_url)
-        logger.debug(f"Navigated to event URL: {event_url}")
-        access_date_element = self.wait.until(
-            EC.presence_of_element_located(
-                (By.XPATH, "//h6[contains(text(), 'not joinable')]")
+        self.display_all_events()
+        event = self._find_event(event_date, time_range)
+        if not event:
+            logger.error(
+                f"No event found for date: {event_date}, time range: {time_range}"
             )
+            return None, None
+
+        access_date_element = event.find_element(
+            By.XPATH, ".//*[contains(text(), 'not joinable')]"
         )
+
         logger.info("Access date element found.")
         join_date_text = access_date_element.text
 
@@ -138,22 +227,11 @@ class Website:
             date = None
 
         try:
-            # extract additional information from the page
-            # Use XPath to select all sibling elements that come after the header in the body.
-            content_elements = self.driver.find_elements(By.XPATH, "//header/following-sibling::*")
-            logger.debug(f"Found {len(content_elements)} elements with XPath '//header/following-sibling::*'.")
-
-            # Dive until we're out of the nested elements
-            for i in range(10):
-                logger.debug(f"Iteration {i}: content_elements count = {len(content_elements)}")
-                if len(content_elements) == 1:
-                    content_elements = content_elements[0].find_elements(By.XPATH, "./*")
-                else:
-                    break
+            extra_content = event.find_element(By.CSS_SELECTOR, EXTRA_CONTENT_BOX)
 
             # Gather the text content of the remaining first element
-            if content_elements:
-                body_content = content_elements[0].text.replace("\n", " - ")
+            if extra_content:
+                body_content = extra_content.text.replace("\n", " - ")
                 logger.debug(f"Final body content: {body_content}")
             else:
                 logger.debug("No nested content elements found.")
@@ -163,14 +241,21 @@ class Website:
 
         return date, body_content
 
-    def register_for_event(self, event_url: str):
+    def register_for_event(self, event_date: str, time_range: str):
         """Registers for the event."""
-        logger.info(f"Registering for the event: {event_url}")
-        self.driver.get(event_url)
-        logger.debug(f"Navigated to event URL: {event_url}")
-        join_button = self.wait.until(
-            EC.element_to_be_clickable((By.XPATH, "//button[contains(text(), 'Join')]"))
+
+        self.display_all_events()
+        event = self._find_event(event_date, time_range)
+
+        join_button = WebDriverWait(event, self.wait_time).until(
+            EC.element_to_be_clickable(
+                (
+                    By.XPATH,
+                    ".//button[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'join')]",
+                )
+            )
         )
+
         logger.debug("Join button found.")
         join_button.click()
         logger.info("Clicked join button.")
