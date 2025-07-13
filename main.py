@@ -123,14 +123,14 @@ def check_for_new_event(headless=True):
                 logger.debug(
                     f"Inserting {event_date, time_range} into database at {registration_time}"
                 )
-                old_urls = events.get_events_by_date(registration_time)
-                if old_urls:
+                old_events = events.get_events_by_date(registration_time)
+                if old_events:
                     logger.info(
-                        f"Event already exists for this date: {old_urls}. Removing old event."
+                        f"Event already exists for this date: {old_events}. Removing old event."
                     )
 
-                    for old_url in old_urls:
-                        events.remove_event(old_url)
+                    for old_event in old_events:
+                        events.remove_event(*old_event)
                 events.insert_event(
                     event_date=event_date,
                     time_range=time_range,
