@@ -15,35 +15,41 @@ class Events:
         self.cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS events (
-                event_url TEXT PRIMARY KEY,
+                event_spec TEXT PRIMARY KEY,
+                event_date TEXT NOT NULL,
+                time_range TEXT NOT NULL,
                 registration_time TIMESTAMP NOT NULL,
                 additional_info TEXT
             )
         """
         )
 
-    def insert_event(self, event_url, registration_time, additional_info=""):
+    def create_spec(self, event_date, time_range):
+        """Creates a unique event specification."""
+        return f"{event_date} {time_range}"
+    
+    def insert_event(self, event_date, time_range, registration_time, additional_info=""):
         try:
             self.cursor.execute(
                 """
-                INSERT INTO events (event_url, registration_time, additional_info)
-                VALUES (?, ?, ?)
+                INSERT INTO events (event_spec, event_date, time_range, registration_time, additional_info)
+                VALUES (?, ?, ?, ?, ?)
             """,
-                (event_url, registration_time, additional_info),
+                (self.create_spec(event_date, time_range), event_date, time_range, registration_time, additional_info),
             )
             self.conn.commit()
         except sqlite3.IntegrityError:
-            print(f"Event with URL {event_url} already exists.")
+            print(f"Event with spec {event_date, time_range} already exists.")
 
-    def get_event_urls_by_date(self, registration_time):
+    def get_events_by_date(self, registration_time):
         self.cursor.execute(
             """
-            SELECT event_url FROM events WHERE registration_time = ?
+            SELECT event_date, time_range FROM events WHERE registration_time = ?
         """,
             (registration_time,),
         )
         rows = self.cursor.fetchall()
-        return [row[0] for row in rows]
+        return [(row[0], row[1]) for row in rows]
 
     def get_next_event_after(self, timestamp=None):
 
@@ -53,7 +59,7 @@ class Events:
         """Finds the next event time after the provided timestamp."""
         self.cursor.execute(
             """
-            SELECT event_url, registration_time FROM events 
+            SELECT event_date, time_range, registration_time FROM events 
             WHERE registration_time > ? 
             ORDER BY registration_time ASC 
             LIMIT 1
@@ -62,21 +68,24 @@ class Events:
         )
         row = self.cursor.fetchone()
         if row:
-            event_url = row[0]
-            registration_time = datetime.strptime(row[1], "%Y-%m-%d %H:%M:%S")
+            event_date = row[0]
+            time_range = row[1]
+            registration_time = datetime.strptime(row[2], "%Y-%m-%d %H:%M:%S")
 
-            return {"event_url": event_url, "registration_time": registration_time}
+            return {"event_date": event_date, "time_range": time_range, "registration_time": registration_time}
         return None
 
-    def remove_event(self, event_url):
-        """Removes a row based on the event_url."""
-        logger.info(f"Removing event: {event_url}")
-
+    def remove_event(self, event_date, time_range):
+        """Removes a row based on the event_spec."""
+        logger.info(f"Removing event: {event_date, time_range}")
+        event_spec = self.create_spec(event_date, time_range)
+        logger.debug(f"Event spec to remove: {event_spec}")
+        
         self.cursor.execute(
             """
-            DELETE FROM events WHERE event_url = ?
+            DELETE FROM events WHERE event_spec = ?
         """,
-            (event_url,),
+            (event_spec,),
         )
         self.conn.commit()
 
@@ -96,7 +105,7 @@ class Events:
         """Returns all rows ordered by descending registration_time."""
         self.cursor.execute(
             """
-            SELECT event_url, registration_time, additional_info FROM events 
+            SELECT event_date, time_range, registration_time, additional_info FROM events 
             ORDER BY registration_time DESC
             """
         )
