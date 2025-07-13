@@ -58,7 +58,7 @@ def extract_event_details(text):
     A tuple containing the date and the time range if found, otherwise None.
     """
     # Regex pattern to match the date and time range format
-    pattern = re.compile(r'(?P<date>\b[A-Z]{3},\s[A-Z]{3,9}\s\d{1,2}\b)\s+(?P<time_range>\d{1,2}:\d{2}(?:[ap]m)?\s-\s\d{1,2}:\d{2}(?:[ap]m)?)')
+    pattern = re.compile(r'(?P<date>\b[A-Z]{3},\s[A-Z]{3,9}\s\d{1,2}\b)\s?(?P<time_range>\d{1,2}:\d{2}(?:[ap]m)?\s-\s\d{1,2}:\d{2}(?:[ap]m)?)')
     match = pattern.search(text)
 
     if match:
