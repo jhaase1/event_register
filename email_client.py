@@ -18,6 +18,7 @@ EMAIL_CAPTURE_PATTERN = re.compile(r"^(.*?)?(?:<(.+@.+)>)?$")
 
 # Initialize logger
 logger = get_logger(__name__)
+logger.setLevel("DEBUG")  # Set logger to debug level for detailed output
 
 class EmailClient:
     def __init__(self):
@@ -261,7 +262,7 @@ class EmailClient:
             message['In-Reply-To'] = email.message_id
 
             logger.debug(f"Message headers: {message.items()}")
-            
+
             encoded_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
 
             create_message = {"raw": encoded_message, "threadId": email.thread_id}
