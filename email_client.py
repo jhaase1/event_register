@@ -250,13 +250,13 @@ class EmailClient:
                 message.add_alternative(reply_html, subtype="html")
 
 
-            me = self.user
+            me = self.user.lower()
 
             logger.debug(f"Replying to email as: {me}")
 
-            message['To'] = ", ".join([address for address in email.To + email.From if address != me])
+            message['To'] = ", ".join([address for address in email.To + email.From if address.lower() != me])
             message['From'] = me
-            message['Cc'] = ", ".join([address for address in email.Cc if address != me])
+            message['Cc'] = ", ".join([address for address in email.Cc if address.lower() != me])
             message['Subject'] = subject or email.subject
             message['References'] = email.message_id
             message['In-Reply-To'] = email.message_id
