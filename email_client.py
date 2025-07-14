@@ -251,13 +251,17 @@ class EmailClient:
 
             me = self.user
 
+            logger.debug(f"Replying to email as: {me}")
+
             message['To'] = ", ".join([address for address in email.To + email.From if address != me])
             message['From'] = me
-            message['Cc'] = ", ".join(email.Cc)
+            message['Cc'] = ", ".join([address for address in email.Cc if address != me])
             message['Subject'] = subject or email.subject
             message['References'] = email.message_id
             message['In-Reply-To'] = email.message_id
 
+            logger.debug(f"Message headers: {message.items()}")
+            
             encoded_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
 
             create_message = {"raw": encoded_message, "threadId": email.thread_id}
