@@ -192,7 +192,7 @@ class Website:
             )
             logger.debug("Access date element found.")
         except Exception as e:
-            logger.error("Access date element not found:", e)
+            logger.error("Access date element not found.", exc_info=True)
             return None, None
         
         logger.info("Access date element found.")
