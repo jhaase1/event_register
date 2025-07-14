@@ -186,10 +186,15 @@ class Website:
             )
             return None, None
 
-        access_date_element = event.find_element(
-            By.XPATH, ".//*[contains(text(), 'not joinable')]"
-        )
-
+        try:
+            access_date_element = event.find_element(
+                By.XPATH, ".//*[contains(text(), 'not joinable')]"
+            )
+            logger.debug("Access date element found.")
+        except Exception as e:
+            logger.error("Access date element not found:", e)
+            return None, None
+        
         logger.info("Access date element found.")
         join_date_text = access_date_element.text
 
