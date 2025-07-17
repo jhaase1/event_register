@@ -52,12 +52,13 @@ def register_for_next_event(headless=True):
     dwell_until(registration_time, offset_minutes=LOGIN_BUFFER)
 
     website.login()
+    event_url = website.get_event_url(event_date, time_range)
 
     logger.info("Waiting until the exact registration time.")
     dwell_until(registration_time, offset_seconds=-DELAY)
 
     logger.info(f"Registering for the event: {event_date} {time_range}")
-    website.register_for_event(event_date, time_range)
+    website.register_for_event(event_date=event_date, time_range=time_range, event_url=event_url)
 
     logger.info("Closing website and database connections.")
     website.close()
