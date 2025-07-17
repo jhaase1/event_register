@@ -8,6 +8,7 @@ from selenium.webdriver.chrome.options import Options
 
 import re
 from datetime import datetime
+import tkinter as tk
 import time
 import json
 from urllib.parse import urlparse
@@ -246,10 +247,57 @@ class Website:
 
         return date, body_content
 
-    def register_for_event(self, event_date: str, time_range: str):
-        """Registers for the event."""
+    def get_event_url(self, event_date: str, time_range: str):
+        """Finds the share button for the specified event."""
+        logger.info(f"Finding share button for event: {event_date}, {time_range}")
 
         self.display_all_events()
+        event = self._find_event(event_date, time_range)
+
+        if not event:
+            logger.error(
+                f"No event found for date: {event_date}, time range: {time_range}"
+            )
+            return None
+
+        try:
+            share_button = WebDriverWait(event, self.wait_time).until(
+                EC.element_to_be_clickable(
+                    (
+                        By.XPATH,
+                        ".//button[contains(@aria-label, 'Share event')]",
+                    )
+                )
+            )
+            logger.debug("Share button found.")
+            
+            root = tk.Tk()
+            root.withdraw()  # to hide the window
+
+            try:
+                share_button.click()
+                time.sleep(1)
+                event_url = root.clipboard_get()
+            except Exception as e:
+                event_url = None
+                logger.error("Failed to get event URL from clipboard.", exc_info=True)
+            finally:
+                root.destroy()
+
+            return event_url
+        except Exception as e:
+            logger.error("Share button not found.", exc_info=True)
+            return None
+    
+    def register_for_event(self, event_date: str, time_range: str, event_url: str):
+        """Registers for the event."""
+
+        if event_url:
+            logger.info(f"Navigating to event URL: {event_url}")
+            self.driver.get(event_url)
+        else:
+            self.display_all_events()
+
         event = self._find_event(event_date, time_range)
 
         join_button = WebDriverWait(event, self.wait_time).until(
