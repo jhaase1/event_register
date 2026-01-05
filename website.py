@@ -18,7 +18,7 @@ logger = get_logger(__name__)
 logger.setLevel("DEBUG")
 
 DATE_BOX = ".css-5j348m"
-EVENT_BOX = "css-dik0t"
+EVENT_BOX = "css-1hm3hnv"
 EXTRA_CONTENT_BOX = ".MuiGrid-root.MuiGrid-container.MuiGrid-wrap-xs-nowrap.css-a2e4ud"
 
 
@@ -140,34 +140,37 @@ class Website:
 
     def _find_event(self, event_date: str, time_range: str):
         """
-        Finds an event based on the provided date and time range.
-        This method searches for an event that matches the specified date and time range and returns its parent element.
-        Args:
-            event_date (str): The date string to search for in the event elements.
-            time_range (str): The time range string to search for in the event elements.
-        Returns:
-            WebElement: The parent element of the found event.
-        Raises:
-            AssertionError: If no matching event is found.
+        Finds an event card based on the provided date and time range.
+        This version searches for a card-like element containing both strings.
         """
-
-        date_time_elements = self.wait.until(
-            EC.presence_of_element_located(
-                (
-                    By.XPATH,
-                    f"//h6[contains(text(), '{event_date}')]/following-sibling::h6[contains(text(), '{time_range}')]",
+        # Find the card that contains both the date and time strings.
+        # Using normalize-space and case-insensitive check for classes.
+        xpath = (
+            f"//*[contains(@class, '{EVENT_BOX}') and "
+            f".//h6[contains(normalize-space(.), '{event_date}')] and "
+            f".//h6[contains(normalize-space(.), '{time_range}')]]"
+        )
+        
+        try:
+            event = self.wait.until(EC.presence_of_element_located((By.XPATH, xpath)))
+            logger.debug(f"Event card found via robust XPath: {event}")
+            return event
+        except Exception:
+            logger.debug("Falling back to sibling-based search for event.")
+            # Fallback to the original sibling-based logic if the above fails
+            date_time_elements = self.wait.until(
+                EC.presence_of_element_located(
+                    (
+                        By.XPATH,
+                        f"//h6[contains(text(), '{event_date}')]/following-sibling::h6[contains(text(), '{time_range}')]",
+                    )
                 )
             )
-        )
-        logger.debug(f"Event date and time elements found: {date_time_elements}")
-
-        event = date_time_elements.find_element(
-            By.XPATH,
-            f"./ancestor::*[contains(@class, 'MuiCardContent-root') and contains(@class, '{EVENT_BOX}')]",
-        )
-        logger.debug(f"Parent element found: {event}")
-
-        return event
+            event = date_time_elements.find_element(
+                By.XPATH,
+                f"./ancestor::*[contains(@class, '{EVENT_BOX}') or contains(@class, 'MuiCard-root')]",
+            )
+            return event
 
     def determine_access_date(
         self, event_date: str, time_range: str, registration_time: datetime = None
@@ -188,17 +191,47 @@ class Website:
             return None, None
 
         try:
-            access_date_element = event.find_element(
-                By.XPATH, ".//*[contains(text(), 'not joinable')]"
-            )
+            # Case-insensitive search using translate
+            # Using . instead of text() to match element content more reliably
+            xpath = ".//*[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'not joinable')]"
+            access_date_element = event.find_element(By.XPATH, xpath)
             logger.debug("Access date element found.")
+            join_date_text = access_date_element.text
         except Exception as e:
-            logger.error("Access date element not found.", exc_info=True)
-            return None, None
+            # Check if it's already joinable via a 'JOIN' button
+            try:
+                # Same case-insensitive trick for the join button
+                join_button_xpath = ".//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'join')]"
+                event.find_element(By.XPATH, join_button_xpath)
+                logger.info("Event is already joinable.")
+                
+                # Try to extract additional info if available
+                body_content = ""
+                try:
+                    extra_content = event.find_element(By.CSS_SELECTOR, EXTRA_CONTENT_BOX)
+                    if extra_content:
+                        body_content = extra_content.text.replace("\n", " - ")
+                except:
+                    pass
+                return datetime.now(), body_content
+            except:
+                # Look for eligible tiers if we can't find registration info or join button
+                try:
+                    tier_xpath = ".//*[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'tier')]"
+                    tier_elements = event.find_elements(By.XPATH, tier_xpath)
+                    if tier_elements:
+                        # Get the most descriptive tier-related text (often includes the list of tiers)
+                        tier_info = sorted([el.text.strip() for el in tier_elements if el.text.strip()], key=len, reverse=True)[0]
+                        logger.info(f"Found tier info: {tier_info}")
+                        return None, tier_info
+                except:
+                    pass
+                
+                logger.error("Neither 'not joinable' text, 'JOIN' button, nor tier info found.", exc_info=True)
+                return None, None
         
-        logger.info("Access date element found.")
-        join_date_text = access_date_element.text
-
+        logger.info("Access date element text: " + join_date_text)
+        
         date_pattern = r"\b[A-Z][a-z]{2} \d{1,2}\b"
         match = re.search(date_pattern, join_date_text)
 

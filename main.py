@@ -117,8 +117,12 @@ def check_for_new_event(headless=True):
                 logger.info(
                     f"Could not determine the registration time for {event_date, time_range}."
                 )
+                reply = "I could not determine the registration time."
+                if additional_info:
+                    reply += f"\n\nI found this info on the page (check if you are in an eligible tier): {additional_info}"
+                
                 email_client.reply_to_email(
-                    email, "I could not determine the registration time."
+                    email, reply
                 )
             else:
                 logger.debug(
