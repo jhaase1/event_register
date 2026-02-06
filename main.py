@@ -5,8 +5,10 @@ from website import Website
 from dwell import dwell_until, is_within_offset
 from email_client import EmailClient
 from user_intent import extract_user_intent
+from user_config import extract_user_tag, validate_user_tag
 from logging_config import get_logger
 import os
+import threading
 
 if os.name == "nt":
     headless = False
@@ -22,21 +24,51 @@ DELAY = 0  # seconds
 cleanup_days = 8  # days to keep events in the database
 
 
+def register_for_single_event(event_info, headless=True):
+    """Register for a single event (used for concurrent registrations)."""
+    event_date = event_info["event_date"]
+    time_range = event_info["time_range"]
+    registration_time = event_info["registration_time"]
+    user_tag = event_info["user_tag"]
+    
+    logger.info(f"Registering event for user '{user_tag}': {event_date} {time_range} at {registration_time}")
+    
+    try:
+        website = Website(headless=headless)
+        website.login(user_tag=user_tag)
+        event_url = website.get_event_url(event_date, time_range)
+        
+        logger.info(f"Waiting until exact registration time for user '{user_tag}'")
+        dwell_until(registration_time, offset_seconds=-DELAY)
+        
+        logger.info(f"Registering for event (user '{user_tag}'): {event_date} {time_range}")
+        website.register_for_event(event_date=event_date, time_range=time_range, event_url=event_url)
+        
+        logger.info(f"Closing website for user '{user_tag}'")
+        website.close()
+        
+        logger.info(f"Successfully registered user '{user_tag}' for {event_date} {time_range}")
+    except Exception as e:
+        logger.error(f"Error registering user '{user_tag}' for {event_date} {time_range}: {e}", exc_info=True)
+
+
 def register_for_next_event(headless=True):
-    logger.info("Starting registration process for the next event.")
+    logger.info("Starting registration process for the next event(s).")
     # Connect to the database
     events = Events()
-    next_event = events.get_next_event_after()
+    next_events = events.get_next_event_after()
 
-    if next_event:
-        event_date = next_event["event_date"]
-        time_range = next_event["time_range"]
-        registration_time = next_event["registration_time"]
-        logger.info(f"Next event found: {event_date} {time_range} at {registration_time}")
-    else:
+    if not next_events:
         logger.info("No upcoming events.")
         events.close()
         return
+    
+    # All events share the same registration time
+    registration_time = next_events[0]["registration_time"]
+    logger.info(f"Found {len(next_events)} event(s) at registration time: {registration_time}")
+    
+    for event in next_events:
+        logger.info(f"  - User '{event['user_tag']}': {event['event_date']} {event['time_range']}")
 
     if is_within_offset(registration_time, offset_minutes=HOLD_BUFFER):
         logger.info("Holding until registration time.")
@@ -45,23 +77,26 @@ def register_for_next_event(headless=True):
         logger.info("Registration time is too far away.")
         events.close()
         return
-
-    website = Website(headless=headless)
-
-    logger.info("Logging in to the website.")
+    
+    logger.info("Logging in to website(s).")
     dwell_until(registration_time, offset_minutes=LOGIN_BUFFER)
-
-    website.login()
-    event_url = website.get_event_url(event_date, time_range)
-
-    logger.info("Waiting until the exact registration time.")
-    dwell_until(registration_time, offset_seconds=-DELAY)
-
-    logger.info(f"Registering for the event: {event_date} {time_range}")
-    website.register_for_event(event_date=event_date, time_range=time_range, event_url=event_url)
-
-    logger.info("Closing website and database connections.")
-    website.close()
+    
+    # If multiple events, spawn threads for concurrent registration
+    if len(next_events) > 1:
+        logger.info(f"Spawning {len(next_events)} threads for concurrent registration.")
+        threads = []
+        for event in next_events:
+            thread = threading.Thread(target=register_for_single_event, args=(event, headless))
+            threads.append(thread)
+            thread.start()
+        
+        # Wait for all threads to complete
+        for thread in threads:
+            thread.join()
+        logger.info("All concurrent registrations completed.")
+    else:
+        # Single event, no threading needed
+        register_for_single_event(next_events[0], headless=headless)
 
     logger.info("Removing old events from the database.")
     events.remove_old_events(n_days=cleanup_days)
@@ -90,15 +125,31 @@ def check_for_new_event(headless=True):
             email_client.delete_email(email)
 
             continue
+        
+        # Extract user tag from the To address
+        user_tag = extract_user_tag(email.To)
+        logger.info(f"Processing email for user tag: {user_tag}")
+
+        # Validate user tag exists and is properly configured
+        try:
+            validate_user_tag(user_tag)
+        except (ValueError, FileNotFoundError) as e:
+            logger.warning(f"Invalid user tag '{user_tag}': {e}")
+            email_client.reply_to_email(
+                email, f"Sorry, the user '{user_tag}' is not registered in this system."
+            )
+            email_client.mark_email_as_read(email)
+            email_client.archive_email(email)
+            continue
 
         action, event_details = extract_user_intent(email)
         event_date, time_range = event_details or (None, None)
 
         if action == "report":
-            logger.info("Reporting the event.")
-            event_list = events.list_all_events()
+            logger.info(f"Reporting events for user '{user_tag}'.")
+            event_list = events.list_all_events(user_tag=user_tag)
 
-            headers = ["event date", "time range", "registration time", "additional info"]
+            headers = ["event date", "time range", "registration time", "additional info", "user tag"]
             reply = tabulate(event_list, headers=headers)
             reply_html = tabulate(event_list, headers=headers, tablefmt="html")
 
@@ -107,8 +158,8 @@ def check_for_new_event(headless=True):
             )
 
         elif action == "add":
-            logger.info(f"Adding event: {event_date, time_range}")
-            website.login()
+            logger.info(f"Adding event for user '{user_tag}': {event_date, time_range}")
+            website.login(user_tag=user_tag)
             registration_time, additional_info = website.determine_access_date(
                 event_date, time_range
             )
@@ -126,20 +177,21 @@ def check_for_new_event(headless=True):
                 )
             else:
                 logger.debug(
-                    f"Inserting {event_date, time_range} into database at {registration_time}"
+                    f"Inserting {event_date, time_range} into database at {registration_time} for user '{user_tag}'"
                 )
-                old_events = events.get_events_by_date(registration_time)
+                old_events = events.get_events_by_date(registration_time, user_tag=user_tag)
                 if old_events:
                     logger.info(
-                        f"Event already exists for this date: {old_events}. Removing old event."
+                        f"Event already exists for this date and user: {old_events}. Removing old event."
                     )
 
                     for old_event in old_events:
-                        events.remove_event(*old_event)
+                        events.remove_event(*old_event, user_tag=user_tag)
                 events.insert_event(
                     event_date=event_date,
                     time_range=time_range,
                     registration_time=registration_time,
+                    user_tag=user_tag,
                     additional_info=additional_info,
                 )
 
@@ -158,12 +210,12 @@ def check_for_new_event(headless=True):
                 )
 
                 logger.info(
-                    f"Inserted and emailed {event_date} {time_range} into database at {registration_time} with additional info: {additional_info}"
+                    f"Inserted and emailed {event_date} {time_range} into database at {registration_time} for user '{user_tag}' with additional info: {additional_info}"
                 )
 
         elif action == "remove":
-            logger.info(f"Removing event: {event_date, time_range}")
-            events.remove_event(event_date, time_range)
+            logger.info(f"Removing event for user '{user_tag}': {event_date, time_range}")
+            events.remove_event(event_date, time_range, user_tag=user_tag)
             email_client.reply_to_email(
                 email, "I am not going to register for the event.",
                 subject=f"Event Registration Cancellation: {event_date} {time_range}"

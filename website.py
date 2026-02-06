@@ -7,6 +7,7 @@ import selenium.webdriver.support.expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
 
 import re
+import os
 from datetime import datetime
 import tkinter as tk
 import time
@@ -41,21 +42,33 @@ class Website:
             self.driver = webdriver.Chrome()
 
         self.logged_in = False
+        self.user_tag = None
 
         self.wait_time = wait_time
         self.wait = WebDriverWait(self.driver, timeout=self.wait_time)
         logger.info("Web driver initialized.")
 
-    def login(self, website_file="website_token.json"):
+    def login(self, user_tag=None):
         """Logs into the website using the provided credentials."""
         if self.logged_in:
             logger.info("Already logged in.")
             return
 
-        logger.info("Logging into the website.")
+        self.user_tag = user_tag or "default"
+        logger.info(f"Logging into the website for user tag: {self.user_tag}")
+        
+        if user_tag:
+            website_file = os.path.join("user_tokens", f"{user_tag}.json")
+        else:
+            website_file = os.path.join("user_tokens", "default.json")
+
+        if not os.path.exists(website_file):
+            logger.error(f"Website token file not found: {website_file}")
+            raise FileNotFoundError(f"Website token file not found: {website_file}")
+
         with open(website_file, "r") as file:
             website_info = json.load(file)
-        logger.debug("Website information loaded from file.")
+        logger.debug(f"Website information loaded from {website_file}.")
 
         self.default_registration_time = website_info.get(
             "default_registration_time", None
@@ -342,12 +355,12 @@ class Website:
             )
         )
 
-        logger.debug("Join button found.")
+        logger.debug(f"Join button found for user '{self.user_tag}'.")
         join_button.click()
-        logger.info("Clicked join button.")
+        logger.info(f"Clicked join button for user '{self.user_tag}'.")
 
         time.sleep(30)
-        logger.info("Successfully registered for the event.")
+        logger.info(f"Successfully registered for the event (user '{self.user_tag}').")
 
     def close(self):
         """Closes the browser."""

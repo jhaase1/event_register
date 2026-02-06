@@ -254,9 +254,11 @@ class EmailClient:
 
             logger.debug(f"Replying to email as: {me}")
 
-            message['To'] = ", ".join([address for address in email.To + email.From if address.lower() != me])
+            # Only reply to the original sender to avoid leaking plus-tagged addresses to other users
+            message['To'] = ", ".join([address for address in email.From if address.lower() != me])
             message['From'] = me
-            message['Cc'] = ", ".join([address for address in email.Cc if address.lower() != me])
+            # Exclude Cc to prevent exposing other users' plus-tagged addresses
+            # message['Cc'] omitted intentionally for multi-user privacy
             message['Subject'] = subject or email.subject
             message['References'] = email.message_id
             message['In-Reply-To'] = email.message_id
@@ -283,7 +285,7 @@ class EmailClient:
     @staticmethod
     def extract_email_address(emails):
         """Extracts the email address from the sender's email."""
-        return re.findall(r'[\w\.-]+@[\w\.-]+\b', emails or '')
+        return re.findall(r'[\w\.\+-]+@[\w\.-]+\b', emails or '')
         
 
 # Example usage:
