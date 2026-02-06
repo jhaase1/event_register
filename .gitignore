@@ -4,3 +4,7 @@
 *.pyc
 logs/
 .venv/
+
+user_tokens/*
+credentials.json
+email_token.json
