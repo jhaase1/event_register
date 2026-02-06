@@ -145,38 +145,52 @@ def check_for_new_event(headless=True):
     events = Events()
 
     for email in new_emails:
+        # LAYER 1: Global authorization - sender must be in Google Contacts
+        # This is a first-pass filter to reject unknown senders before any processing
         if email_client.is_sender_authorized(email.From):
-            logger.info(f"Authorized sender: {email.From}")
+            logger.info(f"Authorized sender (in contacts): {email.From}")
         else:
-            logger.info(f"Unauthorized sender: {email.From}")
+            logger.info(f"Unauthorized sender (not in contacts): {email.From}")
             email_client.mark_email_as_read(email)
             email_client.delete_email(email)
 
             continue
         
         # Extract user tag from the To address (filter by system email to avoid mismatches)
-        user_tag = extract_user_tag(email.To, system_email=email_client.user)
+        try:
+            user_tag = extract_user_tag(email.To, system_email=email_client.user)
+        except ValueError as e:
+            # Missing system_email or other extraction error - treat as security event
+            logger.error(f"Failed to extract user tag: {e}")
+            email_client.mark_email_as_read(email)
+            email_client.delete_email(email)
+            continue
+            
         logger.info(f"Processing email for user tag: {user_tag}")
 
         # Validate user tag exists and is properly configured
         try:
-            validate_user_tag(user_tag)
+            user_tag = validate_user_tag(user_tag)
         except (ValueError, FileNotFoundError) as e:
             logger.warning(f"Invalid user tag '{user_tag}': {e}")
-            email_client.reply_to_email(
-                email, "Sorry, that user is not registered in this system."
-            )
+            # Silent delete to prevent user enumeration via response timing
+            # (Same behavior as unauthorized access)
             email_client.mark_email_as_read(email)
-            email_client.archive_email(email)
+            email_client.delete_email(email)
             continue
 
-        # Check authorization: Sender must be owner/delegate of the requested tag
+        # LAYER 2: User-specific authorization - sender must be authorized for this user_tag
+        # Even if sender passed global check (is in contacts), they must be explicitly
+        # authorized for the specific user account they're trying to access
         sender_email = email_client.extract_email_address(email.From)[0]
         if not is_sender_allowed(sender_email, user_tag):
-            logger.warning(f"Unauthorized access attempt: {sender_email} tried to access '{user_tag}'")
-            # Do NOT reply to unauthorized requests to prevent leakage/spam
+            logger.warning(
+                f"SECURITY: Unauthorized access attempt - sender '{sender_email}' "
+                f"tried to access user tag '{user_tag}'"
+            )
+            # Silent failure - do NOT reply to prevent confirmation of valid tags
             email_client.mark_email_as_read(email)
-            email_client.delete_email(email) # Or archive, but deletion is safer for security events
+            email_client.delete_email(email)
             continue
 
         action, event_details = extract_user_intent(email)
