@@ -3,9 +3,68 @@
 import os
 import re
 
+import json
+
 from logging_config import get_logger
 
 logger = get_logger(__name__)
+
+
+def load_user_config(user_tag):
+    """Loads the user configuration from the token file.
+    
+    Args:
+        user_tag: The user tag to load configuration for.
+        
+    Returns:
+        dict: The user configuration dictionary.
+    """
+    token_file = get_website_token_file(user_tag)
+    if not os.path.exists(token_file):
+        return None
+    try:
+        with open(token_file, "r") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.error(f"Error loading config for {user_tag}: {e}")
+        return None
+
+def is_sender_allowed(sender_email, user_tag):
+    """Checks if the sender is authorized to act on behalf of the user_tag.
+    
+    Args:
+        sender_email: The email address of the sender.
+        user_tag: The user tag being requested.
+        
+    Returns:
+        bool: True if authorized, False otherwise.
+    """
+    if user_tag == "default":
+        # Default user is accessible by any authorized 'Scheduler' contact
+        # (The calling code already checks is_sender_authorized for general access)
+        return True
+        
+    config = load_user_config(user_tag)
+    if not config:
+        return False
+        
+    # Check if 'authorized_senders' is defined in the config
+    authorized_senders = config.get("authorized_senders", [])
+    
+    # Also allow the user's own email (the one used for the website login)
+    website_email = config.get("email")
+    if website_email:
+        authorized_senders.append(website_email)
+        
+    # Normalize for comparison
+    sender_norm = sender_email.lower()
+    allowed_norm = [s.lower() for s in authorized_senders]
+    
+    if sender_norm in allowed_norm:
+        return True
+        
+    logger.warning(f"Sender {sender_email} is NOT authorized for user tag '{user_tag}'. Allowed: {allowed_norm}")
+    return False
 
 
 def extract_user_tag(email_address, system_email=None):
