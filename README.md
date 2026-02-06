@@ -33,12 +33,26 @@ All plus-tagged emails arrive in the same Gmail inbox. The system extracts the t
         "events_url": "https://example.com/events",
         "email": "alice@example.com",
         "password": "alices-password",
-        "default_registration_time": "14:00:00"
+        "default_registration_time": "14:00:00",
+        "authorized_senders": ["alice@example.com", "delegate@example.com"]
     }
     ```
 2. Authorized senders can now email `base+alice@gmail.com` to manage alice's events.
 
-> **Security Note:** User token files contain plaintext credentials. The `user_tokens/` directory is gitignored by default. Never commit these files to version control.
+### Authorization Model
+
+Every user (including the default user) must have explicit authorization configured:
+
+- **`email`**: The website login email - this address is automatically authorized to send commands
+- **`authorized_senders`**: Additional email addresses that can manage this user's events (e.g., delegates, family members)
+
+If neither `email` nor `authorized_senders` is configured, all requests for that user will be denied (fail-closed security).
+
+> **Security Notes:**
+> - User token files contain plaintext credentials. The `user_tokens/` directory is gitignored by default.
+> - User tags are case-insensitive (e.g., `Alice` and `alice` are treated the same).
+> - Invalid or unauthorized requests are logged but do not reveal whether a user exists (prevents enumeration).
+> - Never commit token files to version control.
 
 ## Setup
 
