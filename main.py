@@ -5,7 +5,7 @@ from website import Website
 from dwell import dwell_until, is_within_offset
 from email_client import EmailClient
 from user_intent import extract_user_intent
-from user_config import extract_user_tag, validate_user_tag
+from user_config import extract_user_tag, validate_user_tag, is_sender_allowed
 from logging_config import get_logger
 import os
 import threading
@@ -168,6 +168,15 @@ def check_for_new_event(headless=True):
             )
             email_client.mark_email_as_read(email)
             email_client.archive_email(email)
+            continue
+
+        # Check authorization: Sender must be owner/delegate of the requested tag
+        sender_email = email_client.extract_email_address(email.From)[0]
+        if not is_sender_allowed(sender_email, user_tag):
+            logger.warning(f"Unauthorized access attempt: {sender_email} tried to access '{user_tag}'")
+            # Do NOT reply to unauthorized requests to prevent leakage/spam
+            email_client.mark_email_as_read(email)
+            email_client.delete_email(email) # Or archive, but deletion is safer for security events
             continue
 
         action, event_details = extract_user_intent(email)
