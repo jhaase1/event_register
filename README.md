@@ -1,21 +1,50 @@
 # Event Register
 
-This project automates the process of registering for events on a specified website. It uses Selenium for web automation, SQLite for event storage, and Gmail API for email interactions.
+This project automates the process of registering for events on a specified website. It uses Selenium for web automation, SQLite for event storage, and Gmail API for email interactions. It supports **multiple users** through a single Gmail address using Gmail's plus-tag system (e.g., `base+user1@gmail.com`).
 
 ## Project Structure
 
+- `main.py`: Main script to check for new events and register for them.
 - `website.py`: Handles website interactions using Selenium.
 - `user_intent.py`: Extracts user intent from emails.
-- `main.py`: Main script to check for new events and register for them.
-- `events.py`: Manages event storage using SQLite.
+- `events.py`: Manages event storage using SQLite (shared database with per-user isolation).
 - `email_client.py`: Handles email interactions using Gmail API.
+- `user_config.py`: User identification and validation utilities for multi-tenant support.
 - `dwell.py`: Provides utility functions for time-based operations.
+- `logging_config.py`: Centralized logging configuration.
+- `user_tokens/`: Directory containing per-user website credential files.
+
+## Multi-User Support
+
+The system uses Gmail's **plus-tag** addressing to route emails to different user profiles:
+
+- Emails sent to `base@gmail.com` → handled as the **default** user
+- Emails sent to `base+alice@gmail.com` → handled as user **alice**
+- Emails sent to `base+bob@gmail.com` → handled as user **bob**
+
+All plus-tagged emails arrive in the same Gmail inbox. The system extracts the tag from the `To` address and routes it to the appropriate user's website credentials.
+
+### Onboarding a New User
+
+1. Create a JSON file in `user_tokens/` named after the user tag (e.g., `user_tokens/alice.json`):
+    ```json
+    {
+        "login_url": "https://example.com/login",
+        "events_url": "https://example.com/events",
+        "email": "alice@example.com",
+        "password": "alices-password",
+        "default_registration_time": "14:00:00"
+    }
+    ```
+2. Authorized senders can now email `base+alice@gmail.com` to manage alice's events.
+
+> **Security Note:** User token files contain plaintext credentials. The `user_tokens/` directory is gitignored by default. Never commit these files to version control.
 
 ## Setup
 
 1. **Install Dependencies**:
     ```sh
-    pip install selenium google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client tabulate
+    pip install selenium google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client tabulate textile
     ```
 
 2. **Download WebDriver**:
@@ -26,6 +55,10 @@ This project automates the process of registering for events on a specified webs
 
 4. **Database Initialization**:
     - The SQLite database (`events.db`) will be created automatically when running the scripts.
+
+5. **User Setup**:
+    - Create `user_tokens/default.json` for the default user (see Onboarding above).
+    - Create additional `user_tokens/<tag>.json` files for each plus-tagged user.
 
 ## Usage
 
@@ -43,15 +76,24 @@ This project automates the process of registering for events on a specified webs
     - The first run will prompt for Gmail authentication and save the token in `email_token.json`.
 
 - **Website Credentials**:
-    - Store website login credentials in `website_token.json`:
+    - Store per-user website login credentials in `user_tokens/<tag>.json`:
     ```json
     {
         "login_url": "https://example.com/login",
+        "events_url": "https://example.com/events",
         "email": "user@example.com",
         "password": "securepassword123",
         "default_registration_time": "15:00:00"
     }
     ```
+
+## Email Commands
+
+Send an email to the system's Gmail address (with optional plus-tag for user routing):
+
+- **Add event**: Include the event date and time range in the email body.
+- **Remove event**: Include "stop", "cancel", or "remove" in the body along with the event details.
+- **Report**: Use "report" in the subject to receive a list of scheduled events.
 
 ## Example
 

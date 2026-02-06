@@ -233,7 +233,7 @@ class EmailClient:
         except HttpError as error:
             logger.info(f"An error occurred: {error}")
 
-    def reply_to_email(self, email, reply_plaintext, reply_html=None, subject=None):
+    def reply_to_email(self, email, reply_plaintext, reply_html=None, subject=None, user_tag=None):
         """Replies to an email."""
         logger.info(f"Replying to email with ID {email.id}...")
         logger.debug(f"Reply content: {reply_plaintext}")
@@ -252,11 +252,25 @@ class EmailClient:
 
             me = self.user.lower()
 
-            logger.debug(f"Replying to email as: {me}")
+            # Use plus-tagged From address for user context
+            if user_tag and user_tag != "default":
+                local_part, domain = me.split('@', 1)
+                from_address = f"{local_part}+{user_tag}@{domain}"
+            else:
+                from_address = me
 
-            # Only reply to the original sender to avoid leaking plus-tagged addresses to other users
-            message['To'] = ", ".join([address for address in email.From if address.lower() != me])
-            message['From'] = me
+            logger.debug(f"Replying to email as: {from_address}")
+
+            # Strip self and any plus-tagged variants from recipients
+            base_local = me.split('@')[0].split('+')[0]
+            base_domain = me.split('@')[1] if '@' in me else ''
+            message['To'] = ", ".join([
+                address for address in email.From
+                if not ('@' in address
+                        and address.split('@')[0].split('+')[0].lower() == base_local
+                        and address.split('@')[1].lower() == base_domain)
+            ])
+            message['From'] = from_address
             # Exclude Cc to prevent exposing other users' plus-tagged addresses
             # message['Cc'] omitted intentionally for multi-user privacy
             message['Subject'] = subject or email.subject
@@ -281,6 +295,44 @@ class EmailClient:
             return send_message
         except HttpError as error:
             logger.info(f"An error occurred: {error}")
+
+    def send_notification(self, subject, body, user_tag=None):
+        """Sends a notification email to the system's own inbox."""
+        logger.info(f"Sending notification: {subject}")
+        if not self.creds:
+            self.authenticate_email()
+
+        try:
+            service = build("gmail", "v1", credentials=self.creds)
+
+            message = EmailMessage()
+            message.set_content(body)
+
+            me = self.user.lower()
+            if user_tag and user_tag != "default":
+                local_part, domain = me.split('@', 1)
+                from_address = f"{local_part}+{user_tag}@{domain}"
+            else:
+                from_address = me
+
+            message['To'] = me
+            message['From'] = from_address
+            message['Subject'] = subject
+
+            encoded_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
+            create_message = {"raw": encoded_message}
+
+            send_message = (
+                service.users()
+                .messages()
+                .send(userId="me", body=create_message)
+                .execute()
+            )
+
+            logger.info(f"Notification sent: {subject}")
+            return send_message
+        except HttpError as error:
+            logger.error(f"Failed to send notification: {error}")
 
     @staticmethod
     def extract_email_address(emails):

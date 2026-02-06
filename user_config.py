@@ -8,12 +8,13 @@ from logging_config import get_logger
 logger = get_logger(__name__)
 
 
-def extract_user_tag(email_address):
+def extract_user_tag(email_address, system_email=None):
     """Extracts the user tag from an email address (e.g., 'user1' from 'email+user1@gmail.com').
     Returns 'default' if no tag is present.
     
     Args:
         email_address: Email address string or list of email addresses
+        system_email: The system's own email address, used to filter To addresses
         
     Returns:
         str: The extracted user tag, or 'default' if no tag is present
@@ -21,10 +22,35 @@ def extract_user_tag(email_address):
     if not email_address:
         return "default"
     
-    # email_address is a list, get the first element
+    # email_address is a list — narrow to addresses matching the system's base email
     if isinstance(email_address, list):
         if not email_address:
             return "default"
+        
+        # If system_email is known, filter to addresses belonging to the system
+        if system_email and '@' in system_email:
+            base_local = system_email.split('@')[0].split('+')[0].lower()
+            base_domain = system_email.split('@')[1].lower()
+            matching = [
+                addr for addr in email_address
+                if '@' in addr
+                and addr.split('@')[0].split('+')[0].lower() == base_local
+                and addr.split('@')[1].lower() == base_domain
+            ]
+            if matching:
+                email_address = matching
+
+        # Warn if multiple addresses carry different plus-tags
+        tags_found = set()
+        for addr in email_address:
+            local = addr.split('@')[0] if '@' in addr else addr
+            if '+' in local:
+                tags_found.add(local.split('+', 1)[1])
+        if len(tags_found) > 1:
+            logger.warning(
+                f"Multiple different plus-tags found in To addresses: {tags_found}. "
+                "Only the first address will be used."
+            )
         email_address = email_address[0]
     
     # Extract the plus tag
@@ -83,18 +109,3 @@ def validate_user_tag(user_tag):
         raise FileNotFoundError(f"No token file found for user '{user_tag}': {token_file}")
     
     return user_tag
-
-
-def get_database_name(user_tag=None):
-    """Returns the database name for a given user tag.
-    
-    Currently uses a shared database with user_tag column for multi-tenancy.
-    This function is provided for future extensibility if per-user databases are needed.
-    
-    Args:
-        user_tag: The user tag (currently unused, reserved for future use)
-        
-    Returns:
-        str: The database filename
-    """
-    return "events.db"

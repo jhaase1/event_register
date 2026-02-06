@@ -9,6 +9,7 @@ from user_config import extract_user_tag, validate_user_tag
 from logging_config import get_logger
 import os
 import threading
+import concurrent.futures
 
 if os.name == "nt":
     headless = False
@@ -24,13 +25,21 @@ DELAY = 0  # seconds
 cleanup_days = 8  # days to keep events in the database
 
 
-def register_for_single_event(event_info, headless=True):
+def register_for_single_event(event_info, headless=True, results=None, results_lock=None):
     """Register for a single event (used for concurrent registrations)."""
     event_date = event_info["event_date"]
     time_range = event_info["time_range"]
     registration_time = event_info["registration_time"]
     user_tag = event_info["user_tag"]
-    
+
+    def _record_result(result):
+        if results is not None:
+            if results_lock:
+                with results_lock:
+                    results.append(result)
+            else:
+                results.append(result)
+
     logger.info(f"Registering event for user '{user_tag}': {event_date} {time_range} at {registration_time}")
     
     try:
@@ -48,8 +57,10 @@ def register_for_single_event(event_info, headless=True):
         website.close()
         
         logger.info(f"Successfully registered user '{user_tag}' for {event_date} {time_range}")
+        _record_result({"user_tag": user_tag, "event": f"{event_date} {time_range}", "success": True})
     except Exception as e:
         logger.error(f"Error registering user '{user_tag}' for {event_date} {time_range}: {e}", exc_info=True)
+        _record_result({"user_tag": user_tag, "event": f"{event_date} {time_range}", "success": False, "error": str(e)})
 
 
 def register_for_next_event(headless=True):
@@ -81,22 +92,39 @@ def register_for_next_event(headless=True):
     logger.info("Logging in to website(s).")
     dwell_until(registration_time, offset_minutes=LOGIN_BUFFER)
     
-    # If multiple events, spawn threads for concurrent registration
+    # Register events (concurrent if multiple, sequential if single)
+    results = []
+    max_workers = min(len(next_events), 4)
     if len(next_events) > 1:
-        logger.info(f"Spawning {len(next_events)} threads for concurrent registration.")
-        threads = []
-        for event in next_events:
-            thread = threading.Thread(target=register_for_single_event, args=(event, headless))
-            threads.append(thread)
-            thread.start()
-        
-        # Wait for all threads to complete
-        for thread in threads:
-            thread.join()
-        logger.info("All concurrent registrations completed.")
+        logger.info(f"Submitting {len(next_events)} events to thread pool (max_workers={max_workers}).")
+        results_lock = threading.Lock()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(register_for_single_event, event, headless, results, results_lock)
+                for event in next_events
+            ]
+            concurrent.futures.wait(futures)
     else:
         # Single event, no threading needed
-        register_for_single_event(next_events[0], headless=headless)
+        register_for_single_event(next_events[0], headless=headless, results=results)
+
+    # Report results and notify on failures
+    succeeded = [r for r in results if r["success"]]
+    failed = [r for r in results if not r["success"]]
+    if results:
+        logger.info(f"Registration complete: {len(succeeded)} succeeded, {len(failed)} failed.")
+    if failed:
+        try:
+            notifier = EmailClient()
+            for f in failed:
+                logger.error(f"FAILED: user '{f['user_tag']}' for {f['event']}: {f['error']}")
+                notifier.send_notification(
+                    subject=f"Registration Failed: {f['event']}",
+                    body=f"Failed to register user '{f['user_tag']}' for {f['event']}.\n\nError: {f['error']}",
+                    user_tag=f["user_tag"],
+                )
+        except Exception as e:
+            logger.error(f"Failed to send failure notifications: {e}", exc_info=True)
 
     logger.info("Removing old events from the database.")
     events.remove_old_events(n_days=cleanup_days)
@@ -113,7 +141,7 @@ def check_for_new_event(headless=True):
         logger.info("No new emails found.")
         return
 
-    website = Website(headless=headless)
+    websites = {}  # Per-user Website instances keyed by user_tag
     events = Events()
 
     for email in new_emails:
@@ -126,8 +154,8 @@ def check_for_new_event(headless=True):
 
             continue
         
-        # Extract user tag from the To address
-        user_tag = extract_user_tag(email.To)
+        # Extract user tag from the To address (filter by system email to avoid mismatches)
+        user_tag = extract_user_tag(email.To, system_email=email_client.user)
         logger.info(f"Processing email for user tag: {user_tag}")
 
         # Validate user tag exists and is properly configured
@@ -136,7 +164,7 @@ def check_for_new_event(headless=True):
         except (ValueError, FileNotFoundError) as e:
             logger.warning(f"Invalid user tag '{user_tag}': {e}")
             email_client.reply_to_email(
-                email, f"Sorry, the user '{user_tag}' is not registered in this system."
+                email, "Sorry, that user is not registered in this system."
             )
             email_client.mark_email_as_read(email)
             email_client.archive_email(email)
@@ -148,17 +176,22 @@ def check_for_new_event(headless=True):
         if action == "report":
             logger.info(f"Reporting events for user '{user_tag}'.")
             event_list = events.list_all_events(user_tag=user_tag)
+            # Omit user_tag column (last element) from each row for privacy
+            event_list = [row[:-1] for row in event_list]
 
-            headers = ["event date", "time range", "registration time", "additional info", "user tag"]
+            headers = ["event date", "time range", "registration time", "additional info"]
             reply = tabulate(event_list, headers=headers)
             reply_html = tabulate(event_list, headers=headers, tablefmt="html")
 
             email_client.reply_to_email(
-                email, reply_plaintext=reply, reply_html=reply_html
+                email, reply_plaintext=reply, reply_html=reply_html, user_tag=user_tag
             )
 
         elif action == "add":
             logger.info(f"Adding event for user '{user_tag}': {event_date, time_range}")
+            if user_tag not in websites:
+                websites[user_tag] = Website(headless=headless)
+            website = websites[user_tag]
             website.login(user_tag=user_tag)
             registration_time, additional_info = website.determine_access_date(
                 event_date, time_range
@@ -173,7 +206,7 @@ def check_for_new_event(headless=True):
                     reply += f"\n\nI found this info on the page (check if you are in an eligible tier): {additional_info}"
                 
                 email_client.reply_to_email(
-                    email, reply
+                    email, reply, user_tag=user_tag
                 )
             else:
                 logger.debug(
@@ -207,6 +240,7 @@ def check_for_new_event(headless=True):
                     reply_plaintext=reply,
                     reply_html=reply_html,
                     subject=f"Event Registration Confirmation: {event_date} {time_range}",
+                    user_tag=user_tag,
                 )
 
                 logger.info(
@@ -218,18 +252,23 @@ def check_for_new_event(headless=True):
             events.remove_event(event_date, time_range, user_tag=user_tag)
             email_client.reply_to_email(
                 email, "I am not going to register for the event.",
-                subject=f"Event Registration Cancellation: {event_date} {time_range}"
+                subject=f"Event Registration Cancellation: {event_date} {time_range}",
+                user_tag=user_tag,
             )
 
         elif action is None:
             logger.info("Could not determine the action from the email.")
-            email_client.reply_to_email(email, "I am not sure what you want me to do.")
+            email_client.reply_to_email(email, "I am not sure what you want me to do.", user_tag=user_tag)
 
         email_client.mark_email_as_read(email)
         email_client.archive_email(email)
 
     logger.info("Closing website and database connections.")
-    website.close()
+    for tag, website in websites.items():
+        try:
+            website.close()
+        except Exception as e:
+            logger.error(f"Error closing website for user '{tag}': {e}")
     events.close()
 
 
