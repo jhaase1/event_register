@@ -336,8 +336,23 @@ class EmailClient:
 
     @staticmethod
     def extract_email_address(emails):
-        """Extracts the email address from the sender's email."""
-        return re.findall(r'[\w\.\+-]+@[\w\.-]+\b', emails or '')
+        """Extracts the email address from the sender's email.
+        
+        Args:
+            emails: A string or list of email addresses/headers
+            
+        Returns:
+            list: List of extracted email addresses
+        """
+        if emails is None:
+            return []
+        if isinstance(emails, list):
+            # Flatten list of addresses
+            result = []
+            for email_str in emails:
+                result.extend(re.findall(r'[\w\.\+-]+@[\w\.-]+\b', email_str or ''))
+            return result
+        return re.findall(r'[\w\.\+-]+@[\w\.-]+\b', emails)
         
 
 # Example usage:
