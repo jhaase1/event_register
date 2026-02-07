@@ -143,6 +143,7 @@ def check_for_new_event(headless=True):
 
     websites = {}  # Per-user Website instances keyed by user_tag
     events = Events()
+    deferred_reports = []  # Store report requests until all other emails are processed
 
     for email in new_emails:
         # LAYER 1: Global authorization - sender must be in Google Contacts
@@ -197,18 +198,9 @@ def check_for_new_event(headless=True):
         event_date, time_range = event_details or (None, None)
 
         if action == "report":
-            logger.info(f"Reporting events for user '{user_tag}'.")
-            event_list = events.list_all_events(user_tag=user_tag)
-            # Omit user_tag column (last element) from each row for privacy
-            event_list = [row[:-1] for row in event_list]
-
-            headers = ["event date", "time range", "registration time", "additional info"]
-            reply = tabulate(event_list, headers=headers)
-            reply_html = tabulate(event_list, headers=headers, tablefmt="html")
-
-            email_client.reply_to_email(
-                email, reply_plaintext=reply, reply_html=reply_html, user_tag=user_tag
-            )
+            logger.info(f"Deferring report for user '{user_tag}' until all other emails are processed.")
+            deferred_reports.append((email, user_tag))
+            continue
 
         elif action == "add":
             logger.info(f"Adding event for user '{user_tag}': {event_date, time_range}")
@@ -285,6 +277,21 @@ def check_for_new_event(headless=True):
 
         email_client.mark_email_as_read(email)
         email_client.archive_email(email)
+
+    # Process deferred report requests now that all add/remove actions are complete
+    for report_email, report_user_tag in deferred_reports:
+        logger.info(f"Reporting events for user '{report_user_tag}' (deferred).")
+        event_list = events.list_all_events(user_tag=report_user_tag)
+        # Omit user_tag column (last element) from each row for privacy
+        event_list = [row[:-1] for row in event_list]
+
+        headers = ["event date", "time range", "registration time", "additional info"]
+        reply = tabulate(event_list, headers=headers)
+        reply_html = tabulate(event_list, headers=headers, tablefmt="html")
+
+        email_client.reply_to_email(
+            report_email, reply_plaintext=reply, reply_html=reply_html, user_tag=report_user_tag
+        )
 
     logger.info("Closing website and database connections.")
     for tag, website in websites.items():
