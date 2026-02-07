@@ -162,23 +162,28 @@ class Events:
         self.conn.commit()
 
     def list_all_events(self, user_tag):
-        """Returns all rows ordered by descending registration_time."""
-        if user_tag is not None:
-            self.cursor.execute(
-                """
-                SELECT event_date, time_range, registration_time, additional_info, user_tag FROM events 
-                WHERE user_tag = ?
-                ORDER BY registration_time DESC
-                """,
-                (user_tag,)
-            )
-        else:
-            self.cursor.execute(
-                """
-                SELECT event_date, time_range, registration_time, additional_info, user_tag FROM events 
-                ORDER BY registration_time DESC
-                """
-            )
+        """Returns all rows for a specific user, ordered by descending registration_time.
+        
+        Args:
+            user_tag: Required. The user tag to filter events by.
+            
+        Returns:
+            list: List of event tuples for the specified user.
+            
+        Raises:
+            ValueError: If user_tag is None or empty.
+        """
+        if not user_tag:
+            raise ValueError("user_tag is required to list events (cannot list across all users)")
+        
+        self.cursor.execute(
+            """
+            SELECT event_date, time_range, registration_time, additional_info, user_tag FROM events 
+            WHERE user_tag = ?
+            ORDER BY registration_time DESC
+            """,
+            (user_tag,)
+        )
         rows = self.cursor.fetchall()
         return rows
 
