@@ -25,7 +25,9 @@ DELAY = 0  # seconds
 cleanup_days = 8  # days to keep events in the database
 
 
-def register_for_single_event(event_info, headless=True, results=None, results_lock=None):
+def register_for_single_event(
+    event_info, headless=True, results=None, results_lock=None
+):
     """Register for a single event (used for concurrent registrations)."""
     event_date = event_info["event_date"]
     time_range = event_info["time_range"]
@@ -40,27 +42,51 @@ def register_for_single_event(event_info, headless=True, results=None, results_l
             else:
                 results.append(result)
 
-    logger.info(f"Registering event for user '{user_tag}': {event_date} {time_range} at {registration_time}")
-    
+    logger.info(
+        f"Registering event for user '{user_tag}': {event_date} {time_range} at {registration_time}"
+    )
+
     try:
         website = Website(headless=headless)
         website.login(user_tag=user_tag)
         event_url = website.get_event_url(event_date, time_range)
-        
+
         logger.info(f"Waiting until exact registration time for user '{user_tag}'")
         dwell_until(registration_time, offset_seconds=-DELAY)
-        
-        logger.info(f"Registering for event (user '{user_tag}'): {event_date} {time_range}")
-        website.register_for_event(event_date=event_date, time_range=time_range, event_url=event_url)
-        
+
+        logger.info(
+            f"Registering for event (user '{user_tag}'): {event_date} {time_range}"
+        )
+        website.register_for_event(
+            event_date=event_date, time_range=time_range, event_url=event_url
+        )
+
         logger.info(f"Closing website for user '{user_tag}'")
         website.close()
-        
-        logger.info(f"Successfully registered user '{user_tag}' for {event_date} {time_range}")
-        _record_result({"user_tag": user_tag, "event": f"{event_date} {time_range}", "success": True})
+
+        logger.info(
+            f"Successfully registered user '{user_tag}' for {event_date} {time_range}"
+        )
+        _record_result(
+            {
+                "user_tag": user_tag,
+                "event": f"{event_date} {time_range}",
+                "success": True,
+            }
+        )
     except Exception as e:
-        logger.error(f"Error registering user '{user_tag}' for {event_date} {time_range}: {e}", exc_info=True)
-        _record_result({"user_tag": user_tag, "event": f"{event_date} {time_range}", "success": False, "error": str(e)})
+        logger.error(
+            f"Error registering user '{user_tag}' for {event_date} {time_range}: {e}",
+            exc_info=True,
+        )
+        _record_result(
+            {
+                "user_tag": user_tag,
+                "event": f"{event_date} {time_range}",
+                "success": False,
+                "error": str(e),
+            }
+        )
 
 
 def register_for_next_event(headless=True):
@@ -73,13 +99,17 @@ def register_for_next_event(headless=True):
         logger.info("No upcoming events.")
         events.close()
         return
-    
+
     # All events share the same registration time
     registration_time = next_events[0]["registration_time"]
-    logger.info(f"Found {len(next_events)} event(s) at registration time: {registration_time}")
-    
+    logger.info(
+        f"Found {len(next_events)} event(s) at registration time: {registration_time}"
+    )
+
     for event in next_events:
-        logger.info(f"  - User '{event['user_tag']}': {event['event_date']} {event['time_range']}")
+        logger.info(
+            f"  - User '{event['user_tag']}': {event['event_date']} {event['time_range']}"
+        )
 
     if is_within_offset(registration_time, offset_minutes=HOLD_BUFFER):
         logger.info("Holding until registration time.")
@@ -88,19 +118,23 @@ def register_for_next_event(headless=True):
         logger.info("Registration time is too far away.")
         events.close()
         return
-    
+
     logger.info("Logging in to website(s).")
     dwell_until(registration_time, offset_minutes=LOGIN_BUFFER)
-    
+
     # Register events (concurrent if multiple, sequential if single)
     results = []
     max_workers = min(len(next_events), 4)
     if len(next_events) > 1:
-        logger.info(f"Submitting {len(next_events)} events to thread pool (max_workers={max_workers}).")
+        logger.info(
+            f"Submitting {len(next_events)} events to thread pool (max_workers={max_workers})."
+        )
         results_lock = threading.Lock()
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = [
-                executor.submit(register_for_single_event, event, headless, results, results_lock)
+                executor.submit(
+                    register_for_single_event, event, headless, results, results_lock
+                )
                 for event in next_events
             ]
             concurrent.futures.wait(futures)
@@ -112,12 +146,16 @@ def register_for_next_event(headless=True):
     succeeded = [r for r in results if r["success"]]
     failed = [r for r in results if not r["success"]]
     if results:
-        logger.info(f"Registration complete: {len(succeeded)} succeeded, {len(failed)} failed.")
+        logger.info(
+            f"Registration complete: {len(succeeded)} succeeded, {len(failed)} failed."
+        )
     if failed:
         try:
             notifier = EmailClient()
             for f in failed:
-                logger.error(f"FAILED: user '{f['user_tag']}' for {f['event']}: {f['error']}")
+                logger.error(
+                    f"FAILED: user '{f['user_tag']}' for {f['event']}: {f['error']}"
+                )
                 notifier.send_notification(
                     subject=f"Registration Failed: {f['event']}",
                     body=f"Failed to register user '{f['user_tag']}' for {f['event']}.\n\nError: {f['error']}",
@@ -156,7 +194,7 @@ def check_for_new_event(headless=True):
             email_client.delete_email(email)
 
             continue
-        
+
         # Extract user tag from the To address (filter by system email to avoid mismatches)
         try:
             user_tag = extract_user_tag(email.To, system_email=email_client.user)
@@ -166,7 +204,7 @@ def check_for_new_event(headless=True):
             email_client.mark_email_as_read(email)
             email_client.delete_email(email)
             continue
-            
+
         logger.info(f"Processing email for user tag: {user_tag}")
 
         # Validate user tag exists and is properly configured
@@ -198,7 +236,9 @@ def check_for_new_event(headless=True):
         event_date, time_range = event_details or (None, None)
 
         if action == "report":
-            logger.info(f"Deferring report for user '{user_tag}' until all other emails are processed.")
+            logger.info(
+                f"Deferring report for user '{user_tag}' until all other emails are processed."
+            )
             deferred_reports.append((email, user_tag))
             continue
 
@@ -219,15 +259,15 @@ def check_for_new_event(headless=True):
                 reply = "I could not determine the registration time."
                 if additional_info:
                     reply += f"\n\nI found this info on the page (check if you are in an eligible tier): {additional_info}"
-                
-                email_client.reply_to_email(
-                    email, reply, user_tag=user_tag
-                )
+
+                email_client.reply_to_email(email, reply, user_tag=user_tag)
             else:
                 logger.debug(
                     f"Inserting {event_date, time_range} into database at {registration_time} for user '{user_tag}'"
                 )
-                old_events = events.get_events_by_date(registration_time, user_tag=user_tag)
+                old_events = events.get_events_by_date(
+                    registration_time, user_tag=user_tag
+                )
                 if old_events:
                     logger.info(
                         f"Event already exists for this date and user: {old_events}. Removing old event."
@@ -263,17 +303,22 @@ def check_for_new_event(headless=True):
                 )
 
         elif action == "remove":
-            logger.info(f"Removing event for user '{user_tag}': {event_date, time_range}")
+            logger.info(
+                f"Removing event for user '{user_tag}': {event_date, time_range}"
+            )
             events.remove_event(event_date, time_range, user_tag=user_tag)
             email_client.reply_to_email(
-                email, "I am not going to register for the event.",
+                email,
+                "I am not going to register for the event.",
                 subject=f"Event Registration Cancellation: {event_date} {time_range}",
                 user_tag=user_tag,
             )
 
         elif action is None:
             logger.info("Could not determine the action from the email.")
-            email_client.reply_to_email(email, "I am not sure what you want me to do.", user_tag=user_tag)
+            email_client.reply_to_email(
+                email, "I am not sure what you want me to do.", user_tag=user_tag
+            )
 
         email_client.mark_email_as_read(email)
         email_client.archive_email(email)
@@ -290,8 +335,14 @@ def check_for_new_event(headless=True):
         reply_html = tabulate(event_list, headers=headers, tablefmt="html")
 
         email_client.reply_to_email(
-            report_email, reply_plaintext=reply, reply_html=reply_html, user_tag=report_user_tag
+            report_email,
+            reply_plaintext=reply,
+            reply_html=reply_html,
+            user_tag=report_user_tag,
         )
+
+        email_client.mark_email_as_read(email)
+        email_client.archive_email(email)
 
     logger.info("Closing website and database connections.")
     for tag, website in websites.items():
