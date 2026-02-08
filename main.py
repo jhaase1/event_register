@@ -8,6 +8,7 @@ from user_intent import extract_user_intent
 from user_config import extract_user_tag, validate_user_tag, is_sender_allowed
 from logging_config import get_logger
 import os
+import random
 import threading
 import concurrent.futures
 
@@ -20,7 +21,8 @@ logger = get_logger(__name__)
 
 HOLD_BUFFER = 10  # minutes
 LOGIN_BUFFER = 1  # minutes
-DELAY = 0  # seconds
+MIN_DELAY = 0   # seconds
+MAX_DELAY = 5   # seconds
 
 cleanup_days = 8  # days to keep events in the database
 
@@ -51,8 +53,9 @@ def register_for_single_event(
         website.login(user_tag=user_tag)
         event_url = website.get_event_url(event_date, time_range)
 
-        logger.info(f"Waiting until exact registration time for user '{user_tag}'")
-        dwell_until(registration_time, offset_seconds=-DELAY)
+        delay = random.uniform(MIN_DELAY, MAX_DELAY)
+        logger.info(f"Waiting until registration time for user '{user_tag}' (delay: {delay:.2f}s)")
+        dwell_until(registration_time, offset_seconds=-delay)
 
         logger.info(
             f"Registering for event (user '{user_tag}'): {event_date} {time_range}"
