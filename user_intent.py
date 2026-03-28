@@ -4,6 +4,18 @@ from logging_config import get_logger
 logger = get_logger(__name__)
 logger.setLevel("DEBUG")
 
+
+def _strip_quoted_reply_text(body):
+    """Return only the newest user-authored body content from reply threads."""
+    if not body:
+        return ""
+
+    # Common Gmail reply delimiter.
+    newest = re.split(r"\nOn .+ wrote:\n", body, maxsplit=1)[0]
+    # Drop quoted lines that begin with '>'.
+    lines = [line for line in newest.splitlines() if not line.lstrip().startswith(">")]
+    return "\n".join(lines).strip()
+
 def extract_user_intent(email, assumed_action="add"):
     """
     Extracts the user's intent from an email.
@@ -21,11 +33,20 @@ def extract_user_intent(email, assumed_action="add"):
     
     event_details = None
 
-    corpus = email.subject + "\n" + email.body
+    subject_lower = email.subject.lower().strip()
+    body_clean = _strip_quoted_reply_text(email.body)
+    corpus = email.subject + "\n" + body_clean
 
     logger.debug(f"Corpus: {corpus}")
 
-    if "report" in email.subject.lower():
+    # Guard against accidental event extraction from quoted history in reply threads.
+    if subject_lower.startswith("re:"):
+        command_terms = ("report", "stop", "cancel", "remove", "add", "register")
+        if not any(term in corpus.lower() for term in command_terms):
+            logger.info("Reply email without explicit command ignored.")
+            return None, None
+
+    if "report" in corpus.lower():
         logger.info("Detected action: report")
         return "report", None
 
