@@ -2,6 +2,7 @@
 **/*.json
 *.db
 *.ipynb
+!gmail_creds_setup.ipynb
 *.pyc
 logs/
 .venv/
