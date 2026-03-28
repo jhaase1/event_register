@@ -48,6 +48,7 @@ def register_for_single_event(
         f"Registering event for user '{user_tag}': {event_date} {time_range} at {registration_time}"
     )
 
+    website = None
     try:
         website = Website(headless=headless)
         website.login(user_tag=user_tag)
@@ -63,9 +64,6 @@ def register_for_single_event(
         website.register_for_event(
             event_date=event_date, time_range=time_range, event_url=event_url
         )
-
-        logger.info(f"Closing website for user '{user_tag}'")
-        website.close()
 
         logger.info(
             f"Successfully registered user '{user_tag}' for {event_date} {time_range}"
@@ -90,6 +88,15 @@ def register_for_single_event(
                 "error": str(e),
             }
         )
+    finally:
+        if website is not None:
+            try:
+                logger.info(f"Closing website for user '{user_tag}'")
+                website.close()
+            except Exception as close_error:
+                logger.warning(
+                    f"Failed to close website for user '{user_tag}': {close_error}"
+                )
 
 
 def register_for_next_event(headless=True):
@@ -215,8 +222,7 @@ def check_for_new_event(headless=True):
             user_tag = validate_user_tag(user_tag)
         except (ValueError, FileNotFoundError) as e:
             logger.warning(f"Invalid user tag '{user_tag}': {e}")
-            # Silent delete to prevent user enumeration via response timing
-            # (Same behavior as unauthorized access)
+            # Silent archive to prevent user enumeration via response timing.
             email_client.mark_email_as_read(email)
             email_client.archive_email(email)
             continue

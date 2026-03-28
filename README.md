@@ -74,6 +74,17 @@ If neither `email` nor `authorized_senders` is configured, all requests for that
     - Create `user_tokens/default.json` for the default user (see Onboarding above).
     - Create additional `user_tokens/<tag>.json` files for each plus-tagged user.
 
+6. **Notebook Output Stripping (Recommended)**:
+    - Install `nbstripout`:
+    ```sh
+    pip install --upgrade nbstripout
+    ```
+    - Enable the git filter for this repo (uses the committed `.gitattributes` rule):
+    ```sh
+    nbstripout --install --attributes .gitattributes
+    ```
+    - After this, notebook outputs are stripped from commits automatically while your local notebook can still keep outputs during your session.
+
 ## Usage
 
 1. **Check for New Events**:

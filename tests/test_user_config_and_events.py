@@ -1,5 +1,6 @@
 import os
 import sqlite3
+import json
 
 import pytest
 
@@ -11,6 +12,29 @@ from user_config import (
     load_user_config,
     validate_user_tag,
 )
+
+
+@pytest.fixture
+def isolated_default_user(monkeypatch, tmp_path):
+    user_tokens_dir = tmp_path / "user_tokens"
+    user_tokens_dir.mkdir()
+
+    def token_path(user_tag="default"):
+        normalized = (user_tag or "default").lower()
+        return str(user_tokens_dir / f"{normalized}.json")
+
+    monkeypatch.setattr("user_config.get_website_token_file", token_path)
+
+    default_config = {
+        "email": "system@example.com",
+        "authorized_senders": ["delegate@example.com"],
+        "login_url": "https://example.com/login",
+    }
+
+    with open(token_path("default"), "w", encoding="utf-8") as f:
+        json.dump(default_config, f)
+
+    return default_config
 
 
 def _simulate_email_auth_flow(to_addresses, sender_email, system_email):
@@ -43,7 +67,7 @@ def test_get_website_token_file_rejects_path_traversal(tag):
         get_website_token_file(tag)
 
 
-def test_load_user_config_default_exists():
+def test_load_user_config_default_exists(isolated_default_user):
     config = load_user_config("default")
     assert config is not None
     assert "email" in config
@@ -80,11 +104,27 @@ def test_extract_user_tag_list_filters_by_system_email():
     assert result == "alice"
 
 
-def test_validate_user_tag_default():
+def test_extract_user_tag_list_uses_parsed_addresses():
+    result = extract_user_tag(
+        ["Someone <other@example.com>", "My App <myapp+alice@gmail.com>"],
+        system_email="myapp@gmail.com",
+    )
+    assert result == "alice"
+
+
+def test_extract_user_tag_list_no_system_match_raises():
+    with pytest.raises(ValueError):
+        extract_user_tag(
+            ["other@example.com", "another@example.com"],
+            system_email="myapp@gmail.com",
+        )
+
+
+def test_validate_user_tag_default(isolated_default_user):
     assert validate_user_tag("default") == "default"
 
 
-def test_validate_user_tag_case_normalization():
+def test_validate_user_tag_case_normalization(isolated_default_user):
     assert validate_user_tag("DEFAULT") == "default"
 
 
@@ -147,11 +187,8 @@ def test_is_sender_allowed_missing_user_config_fails_closed(monkeypatch):
     assert is_sender_allowed("anyone@example.com", "nonexistent_user") is False
 
 
-def test_email_auth_flow_authorized_default_user():
-    config = load_user_config("default")
-    assert config is not None
-
-    system_email = config["email"]
+def test_email_auth_flow_authorized_default_user(isolated_default_user):
+    system_email = isolated_default_user["email"]
     assert _simulate_email_auth_flow(
         to_addresses=[system_email],
         sender_email=system_email,
@@ -159,11 +196,8 @@ def test_email_auth_flow_authorized_default_user():
     ) is True
 
 
-def test_email_auth_flow_rejects_unauthorized_sender():
-    config = load_user_config("default")
-    assert config is not None
-
-    system_email = config["email"]
+def test_email_auth_flow_rejects_unauthorized_sender(isolated_default_user):
+    system_email = isolated_default_user["email"]
     assert _simulate_email_auth_flow(
         to_addresses=[system_email],
         sender_email="attacker@evil.com",
@@ -171,11 +205,8 @@ def test_email_auth_flow_rejects_unauthorized_sender():
     ) is False
 
 
-def test_email_auth_flow_rejects_nonexistent_plus_tag_user():
-    config = load_user_config("default")
-    assert config is not None
-
-    system_email = config["email"]
+def test_email_auth_flow_rejects_nonexistent_plus_tag_user(isolated_default_user):
+    system_email = isolated_default_user["email"]
     local, domain = system_email.split("@", 1)
     plus_address = f"{local}+fakeuser@{domain}"
 
