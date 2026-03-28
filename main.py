@@ -21,8 +21,8 @@ logger = get_logger(__name__)
 
 HOLD_BUFFER = 10  # minutes
 LOGIN_BUFFER = 1  # minutes
-MIN_DELAY = 0   # seconds
-MAX_DELAY = 5   # seconds
+MIN_DELAY = 4   # seconds
+MAX_DELAY = 6   # seconds
 
 cleanup_days = 8  # days to keep events in the database
 
