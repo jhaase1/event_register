@@ -1,6 +1,12 @@
 *.json
+**/*.json
 *.db
 *.ipynb
+!gmail_creds_setup.ipynb
 *.pyc
 logs/
 .venv/
+
+user_tokens/*
+credentials.json
+email_token.json

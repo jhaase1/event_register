@@ -1,6 +1,7 @@
 import os.path
 import base64
 import re
+import json
 from types import SimpleNamespace
 from email.message import EmailMessage
 import email
@@ -41,8 +42,8 @@ class EmailClient:
             logger.info(f"Loading credentials from {token_file}...")
             try:
                 self.creds = Credentials.from_authorized_user_file(token_file, SCOPES)
-            except RefreshError:
-                logger.warning("Token is invalid or revoked. Deleting token file and reauthenticating...")
+            except (RefreshError, ValueError, json.JSONDecodeError):
+                logger.warning("Token is invalid/corrupt. Deleting token file and reauthenticating...")
                 os.remove(token_file)
                 self.creds = None
 
@@ -68,7 +69,7 @@ class EmailClient:
     def whoami(self):
         """Returns the email address of the authenticated user."""
         logger.info("Fetching authenticated user's email address...")
-        service = build('gmail', 'v1', credentials=self.creds)
+        service = build('gmail', 'v1', credentials=self.creds, cache_discovery=False)
         self.user = service.users().getProfile(userId='me').execute().get('emailAddress')
         logger.info(f"Authenticated as {self.user}")
         logger.debug(f"Authenticated user email: {self.user}")
@@ -85,7 +86,7 @@ class EmailClient:
             sender_email = sender_email[0]
 
         try:
-            service = build("people", "v1", credentials=self.creds)
+            service = build("people", "v1", credentials=self.creds, cache_discovery=False)
             results = (
                 service.people()
                 .connections()
@@ -116,7 +117,7 @@ class EmailClient:
             self.authenticate_email()
 
         try:
-            service = build("gmail", "v1", credentials=self.creds)
+            service = build("gmail", "v1", credentials=self.creds, cache_discovery=False)
             results = (
                 service.users()
                 .messages()
@@ -192,7 +193,7 @@ class EmailClient:
             self.authenticate_email()
 
         try:
-            service = build("gmail", "v1", credentials=self.creds)
+            service = build("gmail", "v1", credentials=self.creds, cache_discovery=False)
             service.users().messages().modify(
                 userId="me", id=email.id, body={"removeLabelIds": ["UNREAD"]}
             ).execute()
@@ -209,7 +210,7 @@ class EmailClient:
             self.authenticate_email()
 
         try:
-            service = build("gmail", "v1", credentials=self.creds)
+            service = build("gmail", "v1", credentials=self.creds, cache_discovery=False)
             service.users().messages().modify(
                 userId="me", id=email.id, body={"removeLabelIds": ["INBOX"]}
             ).execute()
@@ -226,14 +227,14 @@ class EmailClient:
             self.authenticate_email()
 
         try:
-            service = build("gmail", "v1", credentials=self.creds)
+            service = build("gmail", "v1", credentials=self.creds, cache_discovery=False)
             service.users().messages().delete(userId="me", id=email.id).execute()
             logger.info(f"Email with ID {email.id} deleted.")
 
         except HttpError as error:
             logger.info(f"An error occurred: {error}")
 
-    def reply_to_email(self, email, reply_plaintext, reply_html=None, subject=None):
+    def reply_to_email(self, email, reply_plaintext, reply_html=None, subject=None, user_tag=None):
         """Replies to an email."""
         logger.info(f"Replying to email with ID {email.id}...")
         logger.debug(f"Reply content: {reply_plaintext}")
@@ -241,7 +242,7 @@ class EmailClient:
             self.authenticate_email()
 
         try:
-            service = build("gmail", "v1", credentials=self.creds)
+            service = build("gmail", "v1", credentials=self.creds, cache_discovery=False)
 
             message = EmailMessage()
             message.set_content(reply_plaintext)
@@ -252,11 +253,27 @@ class EmailClient:
 
             me = self.user.lower()
 
-            logger.debug(f"Replying to email as: {me}")
+            # Use plus-tagged From address for user context
+            if user_tag and user_tag != "default":
+                local_part, domain = me.split('@', 1)
+                from_address = f"{local_part}+{user_tag}@{domain}"
+            else:
+                from_address = me
 
-            message['To'] = ", ".join([address for address in email.To + email.From if address.lower() != me])
-            message['From'] = me
-            message['Cc'] = ", ".join([address for address in email.Cc if address.lower() != me])
+            logger.debug(f"Replying to email as: {from_address}")
+
+            # Strip self and any plus-tagged variants from recipients
+            base_local = me.split('@')[0].split('+')[0]
+            base_domain = me.split('@')[1] if '@' in me else ''
+            message['To'] = ", ".join([
+                address for address in email.From
+                if not ('@' in address
+                        and address.split('@')[0].split('+')[0].lower() == base_local
+                        and address.split('@')[1].lower() == base_domain)
+            ])
+            message['From'] = from_address
+            # Exclude Cc to prevent exposing other users' plus-tagged addresses
+            # message['Cc'] omitted intentionally for multi-user privacy
             message['Subject'] = subject or email.subject
             message['References'] = email.message_id
             message['In-Reply-To'] = email.message_id
@@ -280,10 +297,63 @@ class EmailClient:
         except HttpError as error:
             logger.info(f"An error occurred: {error}")
 
+    def send_notification(self, subject, body, user_tag=None):
+        """Sends a notification email to the system's own inbox."""
+        logger.info(f"Sending notification: {subject}")
+        if not self.creds:
+            self.authenticate_email()
+
+        try:
+            service = build("gmail", "v1", credentials=self.creds, cache_discovery=False)
+
+            message = EmailMessage()
+            message.set_content(body)
+
+            me = self.user.lower()
+            if user_tag and user_tag != "default":
+                local_part, domain = me.split('@', 1)
+                from_address = f"{local_part}+{user_tag}@{domain}"
+            else:
+                from_address = me
+
+            message['To'] = me
+            message['From'] = from_address
+            message['Subject'] = subject
+
+            encoded_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
+            create_message = {"raw": encoded_message}
+
+            send_message = (
+                service.users()
+                .messages()
+                .send(userId="me", body=create_message)
+                .execute()
+            )
+
+            logger.info(f"Notification sent: {subject}")
+            return send_message
+        except HttpError as error:
+            logger.error(f"Failed to send notification: {error}")
+
     @staticmethod
     def extract_email_address(emails):
-        """Extracts the email address from the sender's email."""
-        return re.findall(r'[\w\.-]+@[\w\.-]+\b', emails or '')
+        """Extracts the email address from the sender's email.
+        
+        Args:
+            emails: A string or list of email addresses/headers
+            
+        Returns:
+            list: List of extracted email addresses
+        """
+        if emails is None:
+            return []
+        if isinstance(emails, list):
+            # Flatten list of addresses
+            result = []
+            for email_str in emails:
+                result.extend(re.findall(r'[\w\.\+-]+@[\w\.-]+\b', email_str or ''))
+            return result
+        return re.findall(r'[\w\.\+-]+@[\w\.-]+\b', emails)
         
 
 # Example usage:
