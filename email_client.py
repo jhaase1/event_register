@@ -1,6 +1,7 @@
 import os.path
 import base64
 import re
+import json
 from types import SimpleNamespace
 from email.message import EmailMessage
 import email
@@ -41,8 +42,8 @@ class EmailClient:
             logger.info(f"Loading credentials from {token_file}...")
             try:
                 self.creds = Credentials.from_authorized_user_file(token_file, SCOPES)
-            except RefreshError:
-                logger.warning("Token is invalid or revoked. Deleting token file and reauthenticating...")
+            except (RefreshError, ValueError, json.JSONDecodeError):
+                logger.warning("Token is invalid/corrupt. Deleting token file and reauthenticating...")
                 os.remove(token_file)
                 self.creds = None
 
@@ -68,7 +69,7 @@ class EmailClient:
     def whoami(self):
         """Returns the email address of the authenticated user."""
         logger.info("Fetching authenticated user's email address...")
-        service = build('gmail', 'v1', credentials=self.creds)
+        service = build('gmail', 'v1', credentials=self.creds, cache_discovery=False)
         self.user = service.users().getProfile(userId='me').execute().get('emailAddress')
         logger.info(f"Authenticated as {self.user}")
         logger.debug(f"Authenticated user email: {self.user}")
@@ -85,7 +86,7 @@ class EmailClient:
             sender_email = sender_email[0]
 
         try:
-            service = build("people", "v1", credentials=self.creds)
+            service = build("people", "v1", credentials=self.creds, cache_discovery=False)
             results = (
                 service.people()
                 .connections()
@@ -116,7 +117,7 @@ class EmailClient:
             self.authenticate_email()
 
         try:
-            service = build("gmail", "v1", credentials=self.creds)
+            service = build("gmail", "v1", credentials=self.creds, cache_discovery=False)
             results = (
                 service.users()
                 .messages()
@@ -192,7 +193,7 @@ class EmailClient:
             self.authenticate_email()
 
         try:
-            service = build("gmail", "v1", credentials=self.creds)
+            service = build("gmail", "v1", credentials=self.creds, cache_discovery=False)
             service.users().messages().modify(
                 userId="me", id=email.id, body={"removeLabelIds": ["UNREAD"]}
             ).execute()
@@ -209,7 +210,7 @@ class EmailClient:
             self.authenticate_email()
 
         try:
-            service = build("gmail", "v1", credentials=self.creds)
+            service = build("gmail", "v1", credentials=self.creds, cache_discovery=False)
             service.users().messages().modify(
                 userId="me", id=email.id, body={"removeLabelIds": ["INBOX"]}
             ).execute()
@@ -226,7 +227,7 @@ class EmailClient:
             self.authenticate_email()
 
         try:
-            service = build("gmail", "v1", credentials=self.creds)
+            service = build("gmail", "v1", credentials=self.creds, cache_discovery=False)
             service.users().messages().delete(userId="me", id=email.id).execute()
             logger.info(f"Email with ID {email.id} deleted.")
 
@@ -241,7 +242,7 @@ class EmailClient:
             self.authenticate_email()
 
         try:
-            service = build("gmail", "v1", credentials=self.creds)
+            service = build("gmail", "v1", credentials=self.creds, cache_discovery=False)
 
             message = EmailMessage()
             message.set_content(reply_plaintext)
@@ -303,7 +304,7 @@ class EmailClient:
             self.authenticate_email()
 
         try:
-            service = build("gmail", "v1", credentials=self.creds)
+            service = build("gmail", "v1", credentials=self.creds, cache_discovery=False)
 
             message = EmailMessage()
             message.set_content(body)
