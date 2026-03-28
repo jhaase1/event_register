@@ -194,7 +194,7 @@ def check_for_new_event(headless=True):
         else:
             logger.info(f"Unauthorized sender (not in contacts): {email.From}")
             email_client.mark_email_as_read(email)
-            email_client.delete_email(email)
+            email_client.archive_email(email)
 
             continue
 
@@ -205,7 +205,7 @@ def check_for_new_event(headless=True):
             # Missing system_email or other extraction error - treat as security event
             logger.error(f"Failed to extract user tag: {e}")
             email_client.mark_email_as_read(email)
-            email_client.delete_email(email)
+            email_client.archive_email(email)
             continue
 
         logger.info(f"Processing email for user tag: {user_tag}")
@@ -218,7 +218,7 @@ def check_for_new_event(headless=True):
             # Silent delete to prevent user enumeration via response timing
             # (Same behavior as unauthorized access)
             email_client.mark_email_as_read(email)
-            email_client.delete_email(email)
+            email_client.archive_email(email)
             continue
 
         # LAYER 2: User-specific authorization - sender must be authorized for this user_tag
@@ -232,7 +232,7 @@ def check_for_new_event(headless=True):
             )
             # Silent failure - do NOT reply to prevent confirmation of valid tags
             email_client.mark_email_as_read(email)
-            email_client.delete_email(email)
+            email_client.archive_email(email)
             continue
 
         action, event_details = extract_user_intent(email)
@@ -344,8 +344,8 @@ def check_for_new_event(headless=True):
             user_tag=report_user_tag,
         )
 
-        email_client.mark_email_as_read(email)
-        email_client.archive_email(email)
+        email_client.mark_email_as_read(report_email)
+        email_client.archive_email(report_email)
 
     logger.info("Closing website and database connections.")
     for tag, website in websites.items():
