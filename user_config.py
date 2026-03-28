@@ -2,6 +2,7 @@
 
 import os
 import re
+from email.utils import parseaddr
 
 import json
 
@@ -107,18 +108,29 @@ def extract_user_tag(email_address, system_email=None):
             logger.error("system_email is required when processing a list of To addresses")
             raise ValueError("system_email must be provided when email_address is a list")
         
-        # Filter to addresses belonging to the system
-        if system_email and '@' in system_email:
-            base_local = system_email.split('@')[0].split('+')[0].lower()
-            base_domain = system_email.split('@')[1].lower()
-            matching = [
-                addr for addr in email_address
-                if '@' in addr
-                and addr.split('@')[0].split('+')[0].lower() == base_local
-                and addr.split('@')[1].lower() == base_domain
-            ]
-            if matching:
-                email_address = matching
+        # Filter to addresses belonging to the system.
+        base_local = system_email.split('@')[0].split('+')[0].lower()
+        base_domain = system_email.split('@')[1].lower()
+
+        parsed_addresses = []
+        for addr in email_address:
+            parsed = parseaddr(addr)[1].strip().lower()
+            if parsed and '@' in parsed:
+                parsed_addresses.append(parsed)
+
+        matching = [
+            addr for addr in parsed_addresses
+            if addr.split('@')[0].split('+')[0] == base_local
+            and addr.split('@')[1] == base_domain
+        ]
+
+        if not matching:
+            logger.warning(
+                "No recipient in To addresses matched the system email base/domain; rejecting."
+            )
+            raise ValueError("No recipient address matched the provided system_email")
+
+        email_address = matching
 
         # Warn if multiple addresses carry different plus-tags
         tags_found = set()
@@ -133,6 +145,12 @@ def extract_user_tag(email_address, system_email=None):
             )
         email_address = email_address[0]
     
+    # Normalize single address from headers like "Name <email@domain>".
+    if isinstance(email_address, str):
+        parsed_single = parseaddr(email_address)[1]
+        if parsed_single:
+            email_address = parsed_single
+
     # Extract the plus tag
     if '+' in email_address:
         # Split on '@' first to get the local part
