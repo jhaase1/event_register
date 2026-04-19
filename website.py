@@ -294,6 +294,26 @@ class Website:
         """Finds the share button for the specified event."""
         logger.info(f"Finding share button for event: {event_date}, {time_range}")
 
+        def _click_modal_element(xpath_candidates):
+            for xpath in xpath_candidates:
+                try:
+                    element = self.wait.until(
+                        EC.presence_of_element_located((By.XPATH, xpath))
+                    )
+                    try:
+                        WebDriverWait(self.driver, self.wait_time).until(
+                            EC.element_to_be_clickable((By.XPATH, xpath))
+                        )
+                        element.click()
+                    except Exception:
+                        # MUI overlays can block native Selenium clicks; JS click is a safe fallback.
+                        self.driver.execute_script("arguments[0].click();", element)
+                    logger.debug(f"Clicked modal element via XPath: {xpath}")
+                    return True
+                except Exception:
+                    continue
+            return False
+
         self.display_all_events()
         event = self._find_event(event_date, time_range)
 
@@ -313,24 +333,53 @@ class Website:
                 )
             )
             logger.debug("Share button found.")
-            
+
             # Inject clipboard write interceptor (thread-safe, per-browser-instance)
             self.driver.execute_script("""
                 window.__interceptedClipboard = null;
-                if (navigator.clipboard && navigator.clipboard.writeText) {
+                if (!window.__clipboardInterceptorInstalled && navigator.clipboard && navigator.clipboard.writeText) {
                     const origWrite = navigator.clipboard.writeText.bind(navigator.clipboard);
                     navigator.clipboard.writeText = function(text) {
                         window.__interceptedClipboard = text;
                         return origWrite(text);
                     };
+                    window.__clipboardInterceptorInstalled = true;
                 }
             """)
 
             share_button.click()
-            time.sleep(1)
+
+            # Modal step 1: select the share scope option "This event only"
+            scope_option_xpaths = [
+                "//span[contains(@class, 'MuiFormControlLabel-label') and normalize-space(.)='This event only']/ancestor::label[1]",
+                "//span[contains(@class, 'MuiFormControlLabel-label') and normalize-space(.)='This event only']",
+                "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'this event only')]",
+                "//label[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'this event only')]",
+                "//*[contains(@role, 'option') and contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'this event only')]",
+            ]
+
+            scope_selected = _click_modal_element(scope_option_xpaths)
+
+            if not scope_selected:
+                logger.warning("Could not explicitly select 'This event only' option; continuing.")
+
+            # Modal step 2: click "Copy link"
+            copy_link_xpaths = [
+                "//button[normalize-space(.)='Copy link']",
+                "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'copy link')]",
+                "//*[@role='button' and contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'copy link')]",
+            ]
+
+            copy_clicked = _click_modal_element(copy_link_xpaths)
+
+            if not copy_clicked:
+                logger.error("Could not find or click 'Copy link' button.")
+                return None
 
             # Read the intercepted clipboard value from the browser's JS context
-            event_url = self.driver.execute_script("return window.__interceptedClipboard;")
+            event_url = WebDriverWait(self.driver, self.wait_time).until(
+                lambda d: d.execute_script("return window.__interceptedClipboard;")
+            )
 
             if event_url:
                 logger.info(f"Extracted event URL: {event_url}")
