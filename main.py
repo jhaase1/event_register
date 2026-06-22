@@ -1,5 +1,6 @@
 import textile
 from tabulate import tabulate
+import json
 from events import Events
 from website import Website
 from dwell import dwell_until, is_within_offset
@@ -12,6 +13,15 @@ import random
 import threading
 import concurrent.futures
 
+APP_CONFIG_FILE = "app_config.json"
+DEFAULT_APP_CONFIG = {
+    "hold_buffer_minutes": 10,
+    "login_buffer_minutes": 1,
+    "min_delay_seconds": 4,
+    "max_delay_seconds": 6,
+    "cleanup_days": 8,
+}
+
 if os.name == "nt":
     headless = False
 elif os.name == "posix":
@@ -19,12 +29,31 @@ elif os.name == "posix":
 
 logger = get_logger(__name__)
 
-HOLD_BUFFER = 10  # minutes
-LOGIN_BUFFER = 1  # minutes
-MIN_DELAY = 4   # seconds
-MAX_DELAY = 6   # seconds
 
-cleanup_days = 8  # days to keep events in the database
+def load_app_config(config_file=APP_CONFIG_FILE):
+    """Loads runtime settings for the application."""
+    config = DEFAULT_APP_CONFIG.copy()
+
+    if not os.path.exists(config_file):
+        logger.warning(
+            f"App config file not found: {config_file}. Using built-in defaults."
+        )
+        return config
+
+    with open(config_file, "r") as file:
+        loaded_config = json.load(file)
+
+    config.update(loaded_config)
+    return config
+
+
+APP_CONFIG = load_app_config()
+HOLD_BUFFER = APP_CONFIG["hold_buffer_minutes"]  # minutes
+LOGIN_BUFFER = APP_CONFIG["login_buffer_minutes"]  # minutes
+MIN_DELAY = APP_CONFIG["min_delay_seconds"]  # seconds
+MAX_DELAY = APP_CONFIG["max_delay_seconds"]  # seconds
+
+cleanup_days = APP_CONFIG["cleanup_days"]  # days to keep events in the database
 
 
 def register_for_single_event(

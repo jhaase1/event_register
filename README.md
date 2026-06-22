@@ -100,6 +100,10 @@ If neither `email` nor `authorized_senders` is configured, all requests for that
 - **Email Authentication**:
     - The first run will prompt for Gmail authentication and save the token in `email_token.json`.
 
+- **Application Settings**:
+    - Runtime timing and cleanup settings live in `app_config.json` at the repo root.
+    - Current keys: `hold_buffer_minutes`, `login_buffer_minutes`, `min_delay_seconds`, `max_delay_seconds`, `cleanup_days`.
+
 - **Website Credentials**:
     - Store per-user website login credentials in `user_tokens/<tag>.json`:
     ```json
