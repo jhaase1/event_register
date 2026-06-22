@@ -1,0 +1,7 @@
+{
+    "hold_buffer_minutes": 10,
+    "login_buffer_minutes": 1,
+    "min_delay_seconds": 4,
+    "max_delay_seconds": 6,
+    "cleanup_days": 8
+}

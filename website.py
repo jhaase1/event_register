@@ -1,8 +1,10 @@
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.common.by import By
+from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.support.wait import WebDriverWait
 import selenium.webdriver.support.expected_conditions as EC
+from enum import Enum
 
 from selenium.webdriver.chrome.options import Options
 
@@ -23,12 +25,18 @@ EVENT_BOX = "css-1hm3hnv"
 EXTRA_CONTENT_BOX = ".MuiGrid-root.MuiGrid-container.MuiGrid-wrap-xs-nowrap.css-a2e4ud"
 
 
+class EventLoadingMode(str, Enum):
+    SCROLL = "scroll"
+    BUTTON = "button"
+
+
 class Website:
-    def __init__(self, headless=True, wait_time=30):
+    def __init__(self, headless=True, wait_time=30, event_loading_mode=EventLoadingMode.SCROLL):
         """ Initializes the web driver for the website interaction.
         Args:
             headless (bool): Whether to run the browser in headless mode.
             wait_time (int): The maximum wait time for elements to load.
+            event_loading_mode (EventLoadingMode | str): Strategy for loading all events on the page.
         """
         logger.info("Initializing the web driver.")
 
@@ -43,10 +51,24 @@ class Website:
 
         self.logged_in = False
         self.user_tag = None
+        self.event_loading_mode = self._normalize_event_loading_mode(event_loading_mode)
 
         self.wait_time = wait_time
         self.wait = WebDriverWait(self.driver, timeout=self.wait_time)
         logger.info("Web driver initialized.")
+
+    @staticmethod
+    def _normalize_event_loading_mode(event_loading_mode):
+        if isinstance(event_loading_mode, EventLoadingMode):
+            return event_loading_mode
+
+        try:
+            return EventLoadingMode(event_loading_mode)
+        except ValueError:
+            logger.warning(
+                f"Unknown event loading mode '{event_loading_mode}', defaulting to scroll."
+            )
+            return EventLoadingMode.SCROLL
 
     def login(self, user_tag=None):
         """Logs into the website using the provided credentials."""
@@ -114,16 +136,26 @@ class Website:
 
     def display_all_events(self):
         """
-        Continuously clicks the "Load more" button on the events page until all events are loaded.
-        This method counts the number of currently loaded event elements and clicks the "Load more" button
-        as long as new events are being loaded. It waits for the "Load more" button to appear, clicks it,
-        and repeats the process until no more new events are loaded.
-        Raises:
-            AssertionError: If the "Load more" button cannot be found.
+        Loads all events by either scrolling to the bottom of the page or clicking the legacy "Load more" button.
+        The loading strategy is controlled by self.event_loading_mode.
         """
 
         # Ensure we are on the events page
         self._go_to_events_page()
+
+        event_loading_mode = self._normalize_event_loading_mode(
+            getattr(self, "event_loading_mode", EventLoadingMode.SCROLL)
+        )
+
+        if event_loading_mode == EventLoadingMode.BUTTON:
+            self._display_all_events_by_button()
+        else:
+            self._display_all_events_by_scrolling()
+
+        logger.info("All events displayed.")
+
+    def _display_all_events_by_button(self):
+        """Loads events by clicking the legacy "Load more" button until it disappears."""
 
         num_days_loaded = 0
 
@@ -146,7 +178,40 @@ class Website:
             load_more_button.click()
             logger.debug("Clicked load more button.")
 
-        logger.info("All events displayed.")
+    def _display_all_events_by_scrolling(self):
+        """Loads events by scrolling until the page stops growing."""
+
+        previous_event_count = len(self.driver.find_elements(By.CSS_SELECTOR, DATE_BOX))
+        stalled_rounds = 0
+        max_stalled_rounds = 2
+        scroll_probe_timeout = min(3, getattr(self, "wait_time", 30))
+        probe_wait = WebDriverWait(self.driver, timeout=scroll_probe_timeout)
+
+        while True:
+            self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            logger.debug(f"Scrolled to bottom of events page: {previous_event_count = }")
+
+            try:
+                probe_wait.until(
+                    lambda driver: len(driver.find_elements(By.CSS_SELECTOR, DATE_BOX))
+                    > previous_event_count
+                )
+            except TimeoutException:
+                logger.debug(
+                    f"No additional events loaded after scrolling within {scroll_probe_timeout}s."
+                )
+
+            current_event_count = len(self.driver.find_elements(By.CSS_SELECTOR, DATE_BOX))
+
+            if current_event_count <= previous_event_count:
+                stalled_rounds += 1
+                logger.debug(f"No new events loaded after scroll: {stalled_rounds = }")
+                if stalled_rounds >= max_stalled_rounds:
+                    break
+            else:
+                stalled_rounds = 0
+
+            previous_event_count = current_event_count
 
     def _find_event(self, event_date: str, time_range: str):
         """
