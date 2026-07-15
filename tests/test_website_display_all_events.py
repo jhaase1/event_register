@@ -2,15 +2,12 @@ import website
 
 
 class _FakeElement:
-    def __init__(self, text=""):
-        self.text = text
+    pass
 
 
 class _FakeDriver:
     def __init__(self, states):
-        """states: list of dicts like
-        {"date_box_count": int, "indicator": bool, "loaded_text": str or None}
-        """
+        """states: list of dicts like {"date_box_count": int, "indicator": bool}"""
         self.states = states
         self.index = 0
 
@@ -20,9 +17,6 @@ class _FakeDriver:
             return [_FakeElement() for _ in range(state.get("date_box_count", 0))]
         if value == website.LOAD_MORE_INDICATOR_XPATH:
             return [_FakeElement()] if state.get("indicator") else []
-        if value == website.LOADED_RANGE_XPATH:
-            text = state.get("loaded_text")
-            return [_FakeElement(text)] if text is not None else []
         return []
 
 
@@ -118,8 +112,8 @@ def test_scroll_down_scrolls_indicator_into_view_when_present(monkeypatch):
 
 
 def test_display_all_events_by_scrolling_stops_when_count_stalls(monkeypatch):
-    """Legacy signal: no 'load more' indicator on the page at all, DATE_BOX count stops growing
-    for three consecutive scrolls (max_stalled_rounds) before we give up."""
+    """No 'load more' indicator on the page at all: DATE_BOX count stops growing for
+    three consecutive scrolls (max_stalled_rounds) before we give up."""
     site, scroll_calls = _make_site(
         [
             {"date_box_count": 2},
@@ -134,14 +128,28 @@ def test_display_all_events_by_scrolling_stops_when_count_stalls(monkeypatch):
     assert scroll_calls["count"] == 4
 
 
-def test_display_all_events_by_scrolling_continues_via_indicator_when_count_stalls(monkeypatch):
-    """New signal: DATE_BOX count is flat the whole time, but the loaded-range text keeps
-    changing and then the indicator disappears - scrolling should keep going on that alone."""
+def test_display_all_events_by_scrolling_ignores_indicator_text_and_relies_on_count(monkeypatch):
+    """Regression test: the indicator's loaded-date-range text used to keep advancing every
+    scroll even when no new events appeared, which masked a stall indefinitely. Count must be
+    the thing that stalls things out even while the indicator is still present and 'active'."""
+    site, scroll_calls = _make_site(
+        [{"date_box_count": 17, "indicator": True}] * 5,
+        wait_time=1,
+    )
+
+    site._display_all_events_by_scrolling()
+
+    assert scroll_calls["count"] == 3
+
+
+def test_display_all_events_by_scrolling_stops_when_indicator_disappears(monkeypatch):
+    """DATE_BOX count is flat the whole time, but the indicator disappearing is still an
+    immediate, authoritative 'done' signal."""
     site, scroll_calls = _make_site(
         [
-            {"date_box_count": 4, "indicator": True, "loaded_text": "Loaded: Jul 14 - Jul 20"},
-            {"date_box_count": 4, "indicator": True, "loaded_text": "Loaded: Jul 14 - Jul 27"},
-            {"date_box_count": 4, "indicator": False, "loaded_text": None},
+            {"date_box_count": 4, "indicator": True},
+            {"date_box_count": 4, "indicator": True},
+            {"date_box_count": 4, "indicator": False},
         ]
     )
 
@@ -149,18 +157,3 @@ def test_display_all_events_by_scrolling_continues_via_indicator_when_count_stal
 
     assert scroll_calls["count"] == 2
     assert site.driver.index == 2
-
-
-def test_display_all_events_by_scrolling_stops_when_both_signals_stall(monkeypatch):
-    """Neither signal moves for three consecutive scrolls (max_stalled_rounds), so we stop."""
-    site, scroll_calls = _make_site(
-        [
-            {"date_box_count": 4, "indicator": True, "loaded_text": "Loaded: Jul 14 - Jul 20"},
-            {"date_box_count": 4, "indicator": True, "loaded_text": "Loaded: Jul 14 - Jul 20"},
-        ],
-        wait_time=1,
-    )
-
-    site._display_all_events_by_scrolling()
-
-    assert scroll_calls["count"] == 3
