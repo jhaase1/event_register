@@ -25,7 +25,6 @@ DATE_BOX = ".css-5j348m"
 EVENT_BOX = "css-1hm3hnv"
 EXTRA_CONTENT_BOX = ".MuiGrid-root.MuiGrid-container.MuiGrid-wrap-xs-nowrap.css-a2e4ud"
 LOAD_MORE_INDICATOR_XPATH = "//h6[contains(normalize-space(.), 'Scroll down to load more')]"
-LOADED_RANGE_XPATH = "//p[starts-with(normalize-space(.), 'Loaded:')]"
 
 
 class EventLoadingMode(str, Enum):
@@ -205,11 +204,13 @@ class Website:
         """Loads events by scrolling until no further progress is detected.
 
         The site's markup for "more events available" has changed before, so
-        two independent completion signals are checked each round: growth in
-        the DATE_BOX count (legacy signal) and the "load more" indicator's
-        loaded-date-range text / presence (current signal). Progress on
-        either signal is enough to keep going; scrolling stops only once
-        both signals stall.
+        completion is checked two ways: the "load more" indicator disappearing
+        (current signal - authoritative when present) and the DATE_BOX count
+        failing to grow for max_stalled_rounds consecutive scrolls (legacy
+        signal, and the fallback when there's no indicator at all). Note the
+        indicator's loaded-date-range text is NOT used as a progress signal:
+        it keeps advancing every scroll even when no new events are actually
+        loaded, which would otherwise mask a stall indefinitely.
         """
 
         previous_event_count = len(self.driver.find_elements(By.CSS_SELECTOR, DATE_BOX))
@@ -218,30 +219,22 @@ class Website:
         scroll_probe_timeout = min(3, getattr(self, "wait_time", 30))
         probe_wait = WebDriverWait(self.driver, timeout=scroll_probe_timeout)
 
-        def loaded_range_text():
-            elements = self.driver.find_elements(By.XPATH, LOADED_RANGE_XPATH)
-            return elements[0].text if elements else None
-
         def indicator_present():
             return bool(self.driver.find_elements(By.XPATH, LOAD_MORE_INDICATOR_XPATH))
 
         while True:
-            previous_range = loaded_range_text()
             indicator_elements = self.driver.find_elements(By.XPATH, LOAD_MORE_INDICATOR_XPATH)
             had_indicator = bool(indicator_elements)
 
             self._scroll_down(indicator_element=indicator_elements[0] if had_indicator else None)
-            logger.debug(
-                f"Scrolled events page: {previous_event_count = }, {previous_range = }"
-            )
+            logger.debug(f"Scrolled events page: {previous_event_count = }")
 
             def progressed(driver):
                 count_grew = (
                     len(driver.find_elements(By.CSS_SELECTOR, DATE_BOX)) > previous_event_count
                 )
-                range_changed = loaded_range_text() != previous_range
                 indicator_gone = had_indicator and not indicator_present()
-                return count_grew or range_changed or indicator_gone
+                return count_grew or indicator_gone
 
             try:
                 probe_wait.until(progressed)
@@ -255,15 +248,14 @@ class Website:
                 break
 
             current_event_count = len(self.driver.find_elements(By.CSS_SELECTOR, DATE_BOX))
-            current_range = loaded_range_text()
-            made_progress = (
-                current_event_count > previous_event_count or current_range != previous_range
-            )
 
-            if not made_progress:
+            if current_event_count <= previous_event_count:
                 stalled_rounds += 1
                 logger.debug(f"No new events loaded after scroll: {stalled_rounds = }")
                 if stalled_rounds >= max_stalled_rounds:
+                    logger.debug(
+                        "Event count stalled for max_stalled_rounds; assuming end of loaded events."
+                    )
                     break
             else:
                 stalled_rounds = 0
