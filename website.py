@@ -181,15 +181,24 @@ class Website:
             load_more_button.click()
             logger.debug("Clicked load more button.")
 
-    def _scroll_down(self, amount=1200):
-        """Dispatches a real mouse-wheel scroll event.
+    def _scroll_down(self, amount=1200, indicator_element=None):
+        """Jumps to the bottom of the page via JS, then dispatches a real
+        mouse-wheel scroll event.
 
         JS-only scrolling (window.scrollTo / element.scrollIntoView) moves the
-        DOM scroll position without firing a native 'wheel' event. This site's
-        infinite-scroll loader only responds to genuine wheel input, so those
-        JS calls silently do nothing - ActionChains dispatches real wheel
-        input through the browser instead.
+        DOM scroll position without firing a native 'wheel' event, and this
+        site's infinite-scroll loader only responds to genuine wheel input -
+        so the JS jump alone doesn't trigger loading. Doing it first just
+        gets us near the new content so the wheel scroll that follows only
+        needs to travel a short distance to reach it.
         """
+        if indicator_element is not None:
+            self.driver.execute_script(
+                "arguments[0].scrollIntoView({block: 'center'});", indicator_element
+            )
+        else:
+            self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+
         ActionChains(self.driver).scroll_by_amount(0, amount).perform()
 
     def _display_all_events_by_scrolling(self):
@@ -218,9 +227,10 @@ class Website:
 
         while True:
             previous_range = loaded_range_text()
-            had_indicator = indicator_present()
+            indicator_elements = self.driver.find_elements(By.XPATH, LOAD_MORE_INDICATOR_XPATH)
+            had_indicator = bool(indicator_elements)
 
-            self._scroll_down()
+            self._scroll_down(indicator_element=indicator_elements[0] if had_indicator else None)
             logger.debug(
                 f"Scrolled events page: {previous_event_count = }, {previous_range = }"
             )

@@ -36,7 +36,7 @@ def _make_site(states, wait_time=None):
 
     scroll_calls = {"count": 0}
 
-    def fake_scroll_down(amount=1200):
+    def fake_scroll_down(amount=1200, indicator_element=None):
         scroll_calls["count"] += 1
         if site.driver.index < len(site.driver.states) - 1:
             site.driver.index += 1
@@ -72,19 +72,49 @@ def test_display_all_events_can_switch_back_to_button_mode(monkeypatch):
     assert calls == ["go", "button"]
 
 
-def test_display_all_events_by_scrolling_uses_real_wheel_scroll(monkeypatch):
-    """window.scrollTo/scrollIntoView never fire a real wheel event, so scrolling must
-    go through _scroll_down (ActionChains) rather than driver.execute_script directly."""
-    site, scroll_calls = _make_site([{"date_box_count": 2}, {"date_box_count": 2}])
+class _FakeActionChains:
+    calls = []
 
-    def fail_if_called(*args, **kwargs):
-        raise AssertionError("execute_script must not be used to trigger scrolling")
+    def __init__(self, driver):
+        self.driver = driver
 
-    site.driver.execute_script = fail_if_called
+    def scroll_by_amount(self, delta_x, delta_y):
+        self.calls.append((delta_x, delta_y))
+        return self
 
-    site._display_all_events_by_scrolling()
+    def perform(self):
+        pass
 
-    assert scroll_calls["count"] >= 1
+
+def test_scroll_down_jumps_to_bottom_then_dispatches_wheel_scroll(monkeypatch):
+    """window.scrollTo alone never fires a real wheel event, so the JS jump must be
+    followed by an actual ActionChains wheel scroll, not stand in for it."""
+    site = website.Website.__new__(website.Website)
+    js_calls = []
+    site.driver = type("_Driver", (), {"execute_script": lambda self, script, *args: js_calls.append((script, args))})()
+
+    _FakeActionChains.calls = []
+    monkeypatch.setattr(website, "ActionChains", _FakeActionChains)
+
+    site._scroll_down()
+
+    assert js_calls == [("window.scrollTo(0, document.body.scrollHeight);", ())]
+    assert _FakeActionChains.calls == [(0, 1200)]
+
+
+def test_scroll_down_scrolls_indicator_into_view_when_present(monkeypatch):
+    site = website.Website.__new__(website.Website)
+    js_calls = []
+    site.driver = type("_Driver", (), {"execute_script": lambda self, script, *args: js_calls.append((script, args))})()
+
+    _FakeActionChains.calls = []
+    monkeypatch.setattr(website, "ActionChains", _FakeActionChains)
+
+    fake_indicator = object()
+    site._scroll_down(indicator_element=fake_indicator)
+
+    assert js_calls == [("arguments[0].scrollIntoView({block: 'center'});", (fake_indicator,))]
+    assert _FakeActionChains.calls == [(0, 1200)]
 
 
 def test_display_all_events_by_scrolling_stops_when_count_stalls(monkeypatch):
