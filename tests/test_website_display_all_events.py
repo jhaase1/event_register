@@ -118,7 +118,8 @@ def test_scroll_down_scrolls_indicator_into_view_when_present(monkeypatch):
 
 
 def test_display_all_events_by_scrolling_stops_when_count_stalls(monkeypatch):
-    """Legacy signal: no 'load more' indicator on the page at all, DATE_BOX count stops growing."""
+    """Legacy signal: no 'load more' indicator on the page at all, DATE_BOX count stops growing
+    for three consecutive scrolls (max_stalled_rounds) before we give up."""
     site, scroll_calls = _make_site(
         [
             {"date_box_count": 2},
@@ -130,7 +131,7 @@ def test_display_all_events_by_scrolling_stops_when_count_stalls(monkeypatch):
 
     site._display_all_events_by_scrolling()
 
-    assert scroll_calls["count"] == 3
+    assert scroll_calls["count"] == 4
 
 
 def test_display_all_events_by_scrolling_continues_via_indicator_when_count_stalls(monkeypatch):
@@ -151,6 +152,7 @@ def test_display_all_events_by_scrolling_continues_via_indicator_when_count_stal
 
 
 def test_display_all_events_by_scrolling_stops_when_both_signals_stall(monkeypatch):
+    """Neither signal moves for three consecutive scrolls (max_stalled_rounds), so we stop."""
     site, scroll_calls = _make_site(
         [
             {"date_box_count": 4, "indicator": True, "loaded_text": "Loaded: Jul 14 - Jul 20"},
@@ -161,4 +163,4 @@ def test_display_all_events_by_scrolling_stops_when_both_signals_stall(monkeypat
 
     site._display_all_events_by_scrolling()
 
-    assert scroll_calls["count"] == 2
+    assert scroll_calls["count"] == 3
