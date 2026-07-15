@@ -2,6 +2,7 @@ import os.path
 import base64
 import re
 import json
+import sys
 from types import SimpleNamespace
 from email.message import EmailMessage
 import email
@@ -57,6 +58,13 @@ class EmailClient:
                     os.remove(token_file)
                     self.creds = None
             if not self.creds:
+                if not sys.stdin.isatty():
+                    raise RuntimeError(
+                        f"No valid Gmail credentials found in '{token_file}' and this "
+                        "session is non-interactive, so the browser-based OAuth flow "
+                        "can't run. Generate the token interactively on a machine with "
+                        f"a browser and copy '{token_file}' to this host."
+                    )
                 logger.info("Fetching new credentials...")
                 flow = InstalledAppFlow.from_client_secrets_file(
                     "credentials.json", SCOPES
