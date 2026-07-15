@@ -13,16 +13,6 @@ class _FakeDriver:
         """
         self.states = states
         self.index = 0
-        self.window_scroll_calls = 0
-        self.indicator_scroll_calls = 0
-
-    def execute_script(self, script, *args):
-        if script == "window.scrollTo(0, document.body.scrollHeight);":
-            self.window_scroll_calls += 1
-            if self.index < len(self.states) - 1:
-                self.index += 1
-        elif "scrollIntoView" in script:
-            self.indicator_scroll_calls += 1
 
     def find_elements(self, by, value):
         state = self.states[self.index]
@@ -34,6 +24,25 @@ class _FakeDriver:
             text = state.get("loaded_text")
             return [_FakeElement(text)] if text is not None else []
         return []
+
+
+def _make_site(states, wait_time=None):
+    """Builds a Website with a fake driver and a fake _scroll_down that advances
+    the fake driver's state on each call, standing in for a real wheel scroll."""
+    site = website.Website.__new__(website.Website)
+    site.driver = _FakeDriver(states)
+    if wait_time is not None:
+        site.wait_time = wait_time
+
+    scroll_calls = {"count": 0}
+
+    def fake_scroll_down(amount=1200):
+        scroll_calls["count"] += 1
+        if site.driver.index < len(site.driver.states) - 1:
+            site.driver.index += 1
+
+    site._scroll_down = fake_scroll_down
+    return site, scroll_calls
 
 
 def test_display_all_events_uses_scroll_mode_by_default(monkeypatch):
@@ -63,10 +72,24 @@ def test_display_all_events_can_switch_back_to_button_mode(monkeypatch):
     assert calls == ["go", "button"]
 
 
+def test_display_all_events_by_scrolling_uses_real_wheel_scroll(monkeypatch):
+    """window.scrollTo/scrollIntoView never fire a real wheel event, so scrolling must
+    go through _scroll_down (ActionChains) rather than driver.execute_script directly."""
+    site, scroll_calls = _make_site([{"date_box_count": 2}, {"date_box_count": 2}])
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("execute_script must not be used to trigger scrolling")
+
+    site.driver.execute_script = fail_if_called
+
+    site._display_all_events_by_scrolling()
+
+    assert scroll_calls["count"] >= 1
+
+
 def test_display_all_events_by_scrolling_stops_when_count_stalls(monkeypatch):
     """Legacy signal: no 'load more' indicator on the page at all, DATE_BOX count stops growing."""
-    site = website.Website.__new__(website.Website)
-    site.driver = _FakeDriver(
+    site, scroll_calls = _make_site(
         [
             {"date_box_count": 2},
             {"date_box_count": 4},
@@ -77,15 +100,13 @@ def test_display_all_events_by_scrolling_stops_when_count_stalls(monkeypatch):
 
     site._display_all_events_by_scrolling()
 
-    assert site.driver.window_scroll_calls == 3
-    assert site.driver.indicator_scroll_calls == 0
+    assert scroll_calls["count"] == 3
 
 
 def test_display_all_events_by_scrolling_continues_via_indicator_when_count_stalls(monkeypatch):
     """New signal: DATE_BOX count is flat the whole time, but the loaded-range text keeps
     changing and then the indicator disappears - scrolling should keep going on that alone."""
-    site = website.Website.__new__(website.Website)
-    site.driver = _FakeDriver(
+    site, scroll_calls = _make_site(
         [
             {"date_box_count": 4, "indicator": True, "loaded_text": "Loaded: Jul 14 - Jul 20"},
             {"date_box_count": 4, "indicator": True, "loaded_text": "Loaded: Jul 14 - Jul 27"},
@@ -95,21 +116,19 @@ def test_display_all_events_by_scrolling_continues_via_indicator_when_count_stal
 
     site._display_all_events_by_scrolling()
 
-    assert site.driver.window_scroll_calls == 2
-    assert site.driver.indicator_scroll_calls == 2
+    assert scroll_calls["count"] == 2
     assert site.driver.index == 2
 
 
 def test_display_all_events_by_scrolling_stops_when_both_signals_stall(monkeypatch):
-    site = website.Website.__new__(website.Website)
-    site.wait_time = 1
-    site.driver = _FakeDriver(
+    site, scroll_calls = _make_site(
         [
             {"date_box_count": 4, "indicator": True, "loaded_text": "Loaded: Jul 14 - Jul 20"},
             {"date_box_count": 4, "indicator": True, "loaded_text": "Loaded: Jul 14 - Jul 20"},
-        ]
+        ],
+        wait_time=1,
     )
 
     site._display_all_events_by_scrolling()
 
-    assert site.driver.window_scroll_calls == 2
+    assert scroll_calls["count"] == 2
