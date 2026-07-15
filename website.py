@@ -214,7 +214,7 @@ class Website:
 
         previous_event_count = len(self.driver.find_elements(By.CSS_SELECTOR, DATE_BOX))
         stalled_rounds = 0
-        max_stalled_rounds = 2
+        max_stalled_rounds = 3
         scroll_probe_timeout = min(3, getattr(self, "wait_time", 30))
         probe_wait = WebDriverWait(self.driver, timeout=scroll_probe_timeout)
 
