@@ -1,4 +1,6 @@
+import os
 import os.path
+import glob
 import base64
 import re
 import json
@@ -26,6 +28,9 @@ class EmailClient:
     def __init__(self):
         logger.info("Initializing EmailClient...")
         self.creds = None
+        self.webmaster = None
+        # Load optional webmaster config before authenticating
+        self._load_webmaster_config()
         self.authenticate_email()
         self.whoami()
 
@@ -314,15 +319,30 @@ class EmailClient:
         try:
             service = build("gmail", "v1", credentials=self.creds, cache_discovery=False)
 
-            message = EmailMessage()
-            message.set_content(body)
-
             me = self.user.lower()
             if user_tag and user_tag != "default":
                 local_part, domain = me.split('@', 1)
                 from_address = f"{local_part}+{user_tag}@{domain}"
             else:
                 from_address = me
+
+            # Determine if this is a failure notification
+            s = (subject or "").lower()
+            b = (body or "").lower()
+            is_failure = any(k in s or k in b for k in ("fail", "failed", "error", "exception"))
+
+            # If failure, append recent logs to the body to aid diagnosis
+            if is_failure:
+                try:
+                    logs_tail = self._tail_logs()
+                    if logs_tail:
+                        body = f"{body}\n\nRecent logs:\n{logs_tail}"
+                except Exception:
+                    logger.warning("Could not read recent logs to append to notification.")
+
+            # Build and send main notification (to self)
+            message = EmailMessage()
+            message.set_content(body)
 
             message['To'] = me
             message['From'] = from_address
@@ -339,9 +359,78 @@ class EmailClient:
             )
 
             logger.info(f"Notification sent: {subject}")
+
+            # Only notify webmaster for failures (avoid webmaster spam on successes)
+            if self.webmaster and is_failure:
+                try:
+                    wm_message = EmailMessage()
+                    wm_message.set_content(body)
+                    wm_message['To'] = self.webmaster
+                    wm_message['From'] = from_address
+                    wm_message['Subject'] = subject
+
+                    encoded_wm = base64.urlsafe_b64encode(wm_message.as_bytes()).decode()
+                    create_wm = {"raw": encoded_wm}
+
+                    service.users().messages().send(userId="me", body=create_wm).execute()
+                    logger.info(f"Notification also sent to webmaster: {self.webmaster}")
+                except HttpError as error:
+                    logger.error(f"Failed to send notification to webmaster {self.webmaster}: {error}")
+
             return send_message
         except HttpError as error:
             logger.error(f"Failed to send notification: {error}")
+
+    def _tail_logs(self, n_lines=200, max_chars=5000, logs_dir="logs"):
+        """Return the tail of the most recent log file in `logs_dir`.
+
+        - Looks for the newest .txt file in the directory.
+        - Returns up to `n_lines` lines, truncated to `max_chars` characters.
+        """
+        try:
+            pattern = os.path.join(logs_dir, "*.txt")
+            files = glob.glob(pattern)
+            if not files:
+                return ""
+            # If filenames look like YYYY-MM-DD.txt, prefer lexicographically
+            # latest (deterministic and works across filesystems). Otherwise
+            # fall back to modification/creation time.
+            basenames = [os.path.splitext(os.path.basename(p))[0] for p in files]
+            if all(len(b) == 10 and b[4] == '-' and b[7] == '-' and b.replace('-', '').isdigit() for b in basenames):
+                latest = max(files, key=lambda p: os.path.basename(p))
+            else:
+                latest = max(files, key=lambda p: max(os.path.getmtime(p), os.path.getctime(p)))
+            with open(latest, "r", encoding="utf-8", errors="replace") as fh:
+                lines = fh.readlines()
+            tail_lines = lines[-n_lines:]
+            tail = "".join(tail_lines)
+            if len(tail) > max_chars:
+                # keep the last max_chars characters
+                tail = tail[-max_chars:]
+            return tail
+        except Exception as e:
+            logger.debug(f"Error tailing logs: {e}")
+            return ""
+
+    def _load_webmaster_config(self, config_file="webmaster.json"):
+        """Load an optional webmaster configuration file containing an email address.
+
+        Expected format: {"email": "name@example.com"}
+        """
+        try:
+            if os.path.exists(config_file):
+                with open(config_file, "r") as fh:
+                    cfg = json.load(fh)
+                email_addr = cfg.get("email")
+                if email_addr:
+                    self.webmaster = email_addr
+                    logger.info(f"Loaded webmaster config: {self.webmaster}")
+                else:
+                    logger.info("webmaster.json present but no 'email' key found.")
+            else:
+                logger.debug(f"No webmaster config found at {config_file}.")
+        except Exception as e:
+            logger.warning(f"Failed to load webmaster config {config_file}: {e}")
 
     @staticmethod
     def extract_email_address(emails):

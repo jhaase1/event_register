@@ -10,3 +10,4 @@ logs/
 user_tokens/*
 credentials.json
 email_token.json
+webmaster.json

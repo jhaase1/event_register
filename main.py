@@ -12,6 +12,10 @@ import os
 import random
 import threading
 import concurrent.futures
+import traceback
+from datetime import datetime, timezone
+import platform
+import sys
 
 APP_CONFIG_FILE = "app_config.json"
 DEFAULT_APP_CONFIG = {
@@ -84,7 +88,9 @@ def register_for_single_event(
         event_url = website.get_event_url(event_date, time_range)
 
         delay = random.uniform(MIN_DELAY, MAX_DELAY)
-        logger.info(f"Waiting until registration time for user '{user_tag}' (delay: {delay:.2f}s)")
+        logger.info(
+            f"Waiting until registration time for user '{user_tag}' (delay: {delay:.2f}s)"
+        )
         dwell_until(registration_time, offset_seconds=-delay)
 
         logger.info(
@@ -109,12 +115,15 @@ def register_for_single_event(
             f"Error registering user '{user_tag}' for {event_date} {time_range}: {e}",
             exc_info=True,
         )
+        tb = traceback.format_exc()
         _record_result(
             {
                 "user_tag": user_tag,
                 "event": f"{event_date} {time_range}",
                 "success": False,
                 "error": str(e),
+                "traceback": tb,
+                "registration_time": registration_time,
             }
         )
     finally:
@@ -195,9 +204,16 @@ def register_for_next_event(headless=True):
                 logger.error(
                     f"FAILED: user '{f['user_tag']}' for {f['event']}: {f['error']}"
                 )
+                ctx = {
+                    "user_tag": f.get("user_tag"),
+                    "event": f.get("event"),
+                    "registration_time": f.get("registration_time"),
+                    "error": f.get("error"),
+                    "traceback": f.get("traceback"),
+                }
                 notifier.send_notification(
-                    subject=f"Registration Failed: {f['event']}",
-                    body=f"Failed to register user '{f['user_tag']}' for {f['event']}.\n\nError: {f['error']}",
+                    subject="Event registration failed",
+                    body=_format_failure_body(ctx, headless_flag=headless),
                     user_tag=f["user_tag"],
                 )
         except Exception as e:
@@ -299,6 +315,24 @@ def check_for_new_event(headless=True):
                     reply += f"\n\nI found this info on the page (check if you are in an eligible tier): {additional_info}"
 
                 email_client.reply_to_email(email, reply, user_tag=user_tag)
+                try:
+                    notifier = EmailClient()
+                    ctx = {
+                        "user_tag": user_tag,
+                        "event_date": event_date,
+                        "time_range": time_range,
+                        "reason": "could not determine registration time",
+                        "additional_info": additional_info,
+                    }
+                    notifier.send_notification(
+                        subject="Event registration failed",
+                        body=_format_failure_body(ctx, headless_flag=headless),
+                        user_tag=user_tag,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to send failure notification for undetermined registration time"
+                    )
             else:
                 logger.debug(
                     f"Inserting {event_date, time_range} into database at {registration_time} for user '{user_tag}'"
@@ -357,6 +391,24 @@ def check_for_new_event(headless=True):
             email_client.reply_to_email(
                 email, "I am not sure what you want me to do.", user_tag=user_tag
             )
+            try:
+                notifier = EmailClient()
+                ctx = {
+                    "user_tag": user_tag,
+                    "email_from": email.From,
+                    "email_subject": email.subject,
+                    "reason": "could not determine action",
+                    "email_body": email.body,
+                }
+                notifier.send_notification(
+                    subject="Event registration failed",
+                    body=_format_failure_body(ctx, headless_flag=headless),
+                    user_tag=user_tag,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to send failure notification for unknown action"
+                )
 
         email_client.mark_email_as_read(email)
         email_client.archive_email(email)
@@ -389,6 +441,31 @@ def check_for_new_event(headless=True):
         except Exception as e:
             logger.error(f"Error closing website for user '{tag}': {e}")
     events.close()
+
+def _format_failure_body(context: dict, headless_flag: bool = True) -> str:
+    """Build a generalized failure body from a context dictionary.
+
+    Includes timestamp, environment info, and all provided context keys.
+    """
+    lines = []
+    lines.append(f"Timestamp: {datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}")
+    lines.append("Environment:")
+    lines.append(f"  Python: {platform.python_version()}")
+    lines.append(f"  OS: {platform.system()} {platform.release()}")
+    lines.append(f"  Headless: {headless_flag}")
+    lines.append("")
+
+    # Add context fields in a stable order
+    for key in sorted(context.keys()):
+        val = context.get(key)
+        # Pretty-print large values (like tracebacks) with separation
+        if isinstance(val, str) and "\n" in val:
+            lines.append(f"{key}:")
+            lines.append(val)
+        else:
+            lines.append(f"{key}: {val}")
+
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":
