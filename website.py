@@ -2,7 +2,7 @@ from selenium import webdriver
 from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.action_chains import ActionChains
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import TimeoutException, ElementClickInterceptedException
 from selenium.webdriver.support.wait import WebDriverWait
 import selenium.webdriver.support.expected_conditions as EC
 from enum import Enum
@@ -526,7 +526,21 @@ class Website:
         )
 
         logger.debug(f"Join button found for user '{self.user_tag}'.")
-        join_button.click()
+
+        # Scroll the button to the center of the viewport so a sticky header/app
+        # bar (e.g. MuiStack-root) doesn't overlap it and intercept the click.
+        self.driver.execute_script(
+            "arguments[0].scrollIntoView({block: 'center'});", join_button
+        )
+
+        try:
+            join_button.click()
+        except ElementClickInterceptedException:
+            logger.warning(
+                "Native click on join button was intercepted; falling back to JS click."
+            )
+            self.driver.execute_script("arguments[0].click();", join_button)
+
         logger.info(f"Clicked join button for user '{self.user_tag}'.")
 
         time.sleep(30)
