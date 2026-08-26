@@ -1,19 +1,21 @@
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service as ChromeService
+from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.action_chains import ActionChains
-from selenium.common.exceptions import TimeoutException, ElementClickInterceptedException
+from selenium.common.exceptions import (
+    TimeoutException,
+    ElementClickInterceptedException,
+    NoSuchElementException,
+)
 from selenium.webdriver.support.wait import WebDriverWait
 import selenium.webdriver.support.expected_conditions as EC
-from enum import Enum
-
-from selenium.webdriver.chrome.options import Options
 
 import re
 import os
-from datetime import datetime
 import time
 import json
+from datetime import datetime, timedelta
 from urllib.parse import urlparse
 from logging_config import get_logger
 from user_config import get_website_token_file
@@ -21,24 +23,96 @@ from user_config import get_website_token_file
 logger = get_logger(__name__)
 logger.setLevel("DEBUG")
 
-DATE_BOX = ".css-5j348m"
-EVENT_BOX = "css-1hm3hnv"
-EXTRA_CONTENT_BOX = ".MuiGrid-root.MuiGrid-container.MuiGrid-wrap-xs-nowrap.css-a2e4ud"
-LOAD_MORE_INDICATOR_XPATH = "//h6[contains(normalize-space(.), 'Scroll down to load more')]"
+# The site renders these as stable QA hooks across the member portal, so we
+# prefer them over CSS classes (which are generated/hashed and churn on rebuilds).
+EVENT_CARD = "[data-testid='event-card']"
+EVENTS_COUNT_SPAN = "#events-count-span"
+DATE_TIME_SECTION = "[data-testid='date-time-section']"
+REGISTER_BTN = "[data-testid='register-btn']"
+DROPIN_MSG = "[data-testid='dropin-msg']"
+CATEGORY_NAME = "[data-testid='category-name']"
+EVENT_NAME = "[data-testid='event-name']"
+COST = "[data-testid='cost']"
+SLOTS_INFO = "[data-testid='slots-info']"
+RATING_NAMES = "[data-testid='rating-names']"
+SAVE_BTN = "[data-testid='save-btn']"
+CONTINUE_BUTTON = "button[data-testid='Continue']"
+INELIGIBLE_XPATH = (
+    "//*[contains(translate(., "
+    "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'not eligible')]"
+)
+
+MONTHS = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+MONTH_DAY_RE = re.compile(r"(?P<month>[A-Za-z]{3,9})\.?\s+(?P<day>\d{1,2})(?:st|nd|rd|th)?\b")
+
+# Matches both user-typed queries ("9:00am - 10:00am") and the site's own
+# rendering ("10a - 12p"). The start period is optional since users and the
+# site both sometimes omit it when it matches the end period.
+TIME_RANGE_RE = re.compile(
+    r"(?P<h1>\d{1,2})(?::(?P<m1>\d{2}))?\s*(?P<ap1>[ap]\.?m?\.?)?\s*-\s*"
+    r"(?P<h2>\d{1,2})(?::(?P<m2>\d{2}))?\s*(?P<ap2>[ap]\.?m?\.?)",
+    re.IGNORECASE,
+)
+
+# Matches each "<number> <unit>" chunk independently (rather than one fixed
+# days-hours-minutes shape) because the countdown's granularity changes as it
+# nears zero - e.g. "1 day and 23 h", "23 h and 49 min", down to just "45 sec"
+# with no larger unit at all in the final moments before opening.
+OPENS_IN_UNIT_RE = re.compile(r"(\d+)\s*(days?|h|min|sec)\b", re.IGNORECASE)
+OPENS_IN_UNIT_TO_KWARG = {"day": "days", "h": "hours", "min": "minutes", "sec": "seconds"}
 
 
-class EventLoadingMode(str, Enum):
-    SCROLL = "scroll"
-    BUTTON = "button"
+def _parse_month_day(text):
+    """Extracts (month, day) from text like 'MON, MAY 5' or 'Tue, Sep 1st,'."""
+    match = MONTH_DAY_RE.search(text)
+    if not match:
+        return None
+    month = MONTHS.get(match.group("month")[:3].lower())
+    if not month:
+        return None
+    return month, int(match.group("day"))
+
+
+def _to_24h(hour, period):
+    hour = hour % 12
+    return hour + 12 if period == "p" else hour
+
+
+def _parse_time_range(text):
+    """Extracts (start_hour, start_min, end_hour, end_min) in 24h time."""
+    match = TIME_RANGE_RE.search(text)
+    if not match:
+        return None
+    ap2 = match.group("ap2")[0].lower()
+    ap1 = match.group("ap1")
+    ap1 = ap1[0].lower() if ap1 else ap2
+    h1 = _to_24h(int(match.group("h1")), ap1)
+    h2 = _to_24h(int(match.group("h2")), ap2)
+    return h1, int(match.group("m1") or 0), h2, int(match.group("m2") or 0)
+
+
+def _parse_opens_in(text):
+    """Parses 'Registration opens in 1 day and 23 h' / '23 h and 49 min' / '45 sec' into a timedelta."""
+    matches = OPENS_IN_UNIT_RE.findall(text)
+    if not matches:
+        return None
+    kwargs = {}
+    for value, unit in matches:
+        key = OPENS_IN_UNIT_TO_KWARG[unit.lower().rstrip("s")]
+        kwargs[key] = kwargs.get(key, 0) + int(value)
+    return timedelta(**kwargs)
 
 
 class Website:
-    def __init__(self, headless=True, wait_time=30, event_loading_mode=EventLoadingMode.SCROLL):
-        """ Initializes the web driver for the website interaction.
+    def __init__(self, headless=True, wait_time=30):
+        """Initializes the web driver for the website interaction.
         Args:
             headless (bool): Whether to run the browser in headless mode.
             wait_time (int): The maximum wait time for elements to load.
-            event_loading_mode (EventLoadingMode | str): Strategy for loading all events on the page.
         """
         logger.info("Initializing the web driver.")
 
@@ -53,24 +127,10 @@ class Website:
 
         self.logged_in = False
         self.user_tag = None
-        self.event_loading_mode = self._normalize_event_loading_mode(event_loading_mode)
 
         self.wait_time = wait_time
         self.wait = WebDriverWait(self.driver, timeout=self.wait_time)
         logger.info("Web driver initialized.")
-
-    @staticmethod
-    def _normalize_event_loading_mode(event_loading_mode):
-        if isinstance(event_loading_mode, EventLoadingMode):
-            return event_loading_mode
-
-        try:
-            return EventLoadingMode(event_loading_mode)
-        except ValueError:
-            logger.warning(
-                f"Unknown event loading mode '{event_loading_mode}', defaulting to scroll."
-            )
-            return EventLoadingMode.SCROLL
 
     def login(self, user_tag=None):
         """Logs into the website using the provided credentials."""
@@ -80,7 +140,7 @@ class Website:
 
         self.user_tag = user_tag or "default"
         logger.info(f"Logging into the website for user tag: {self.user_tag}")
-        
+
         website_file = get_website_token_file(self.user_tag)
 
         if not os.path.exists(website_file):
@@ -94,6 +154,7 @@ class Website:
         self.default_registration_time = website_info.get(
             "default_registration_time", None
         )
+        self.skill_level = website_info.get("skill_level", None)
 
         login_url = website_info["login_url"]
         self.website_domain = urlparse(login_url).netloc.lower()
@@ -103,26 +164,22 @@ class Website:
 
         self.driver.get(login_url)
         logger.debug(f"Navigated to login URL: {login_url}")
-        self.wait.until(EC.element_to_be_clickable((By.NAME, "email"))).send_keys(
-            website_info["email"]
-        )
+
+        email_field = self.wait.until(EC.element_to_be_clickable((By.NAME, "email")))
+        email_field.send_keys(website_info["email"])
         logger.debug("Entered email.")
-        self.wait.until(EC.element_to_be_clickable((By.NAME, "password"))).send_keys(
+        self.driver.find_element(By.NAME, "password").send_keys(
             website_info["password"]
         )
         logger.debug("Entered password.")
-        login_button = self.wait.until(
-            EC.element_to_be_clickable(
-                (By.XPATH, "//button[contains(text(), 'Login')]")
-            )
-        )
-        login_button.click()
-        logger.debug("Clicked login button.")
         self.wait.until(
-            EC.presence_of_element_located(
-                (By.XPATH, "//button[contains(text(), 'Join')]")
-            )
-        )
+            EC.element_to_be_clickable((By.CSS_SELECTOR, CONTINUE_BUTTON))
+        ).click()
+        logger.debug("Clicked continue button.")
+
+        # The login form is replaced by the member portal on success; waiting for
+        # it to go stale is a reliable "navigation happened" signal.
+        self.wait.until(EC.staleness_of(email_field))
 
         logger.info("Successfully logged into the website.")
         self.logged_in = True
@@ -133,108 +190,61 @@ class Website:
         self.driver.get(self.events_url)
         logger.debug(f"Events page loaded: {self.events_url}")
 
-        # Wait for the events to load
-        self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, DATE_BOX)))
+        # Rendered even when there are zero matching events, so it's a reliable
+        # "the list finished its initial load" signal either way.
+        self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, EVENTS_COUNT_SPAN)))
+
+    def _total_events_count(self):
+        try:
+            text = self.driver.find_element(By.CSS_SELECTOR, EVENTS_COUNT_SPAN).text
+        except NoSuchElementException:
+            return None
+        match = re.search(r"\d+", text)
+        return int(match.group(0)) if match else None
 
     def display_all_events(self):
-        """
-        Loads all events by either scrolling to the bottom of the page or clicking the legacy "Load more" button.
-        The loading strategy is controlled by self.event_loading_mode.
-        """
-
-        # Ensure we are on the events page
+        """Navigates to the events page and scrolls until every matching event is loaded."""
         self._go_to_events_page()
-
-        event_loading_mode = self._normalize_event_loading_mode(
-            getattr(self, "event_loading_mode", EventLoadingMode.SCROLL)
-        )
-
-        if event_loading_mode == EventLoadingMode.BUTTON:
-            self._display_all_events_by_button()
-        else:
-            self._display_all_events_by_scrolling()
-
+        self._display_all_events_by_scrolling()
         logger.info("All events displayed.")
 
-    def _display_all_events_by_button(self):
-        """Loads events by clicking the legacy "Load more" button until it disappears."""
-
-        num_days_loaded = 0
-
-        while num_days_loaded < (
-            num_days_loaded := len(self.driver.find_elements(By.CSS_SELECTOR, DATE_BOX))
-        ):
-            logger.debug(f"clicking load more {num_days_loaded = }")
-
-            try:
-                load_more_button = self.wait.until(
-                    EC.presence_of_element_located(
-                        (By.XPATH, "//button[text()='Load more']")
-                    )
-                )
-                logger.debug("Load more button found.")
-            except Exception as e:
-                logger.error("Button not found within 10 seconds:", e)
-                raise AssertionError("Load more button not found")
-
-            load_more_button.click()
-            logger.debug("Clicked load more button.")
-
-    def _scroll_down(self, amount=1200, indicator_element=None):
+    def _scroll_down(self, amount=1200):
         """Jumps to the bottom of the page via JS, then dispatches a real
         mouse-wheel scroll event.
 
-        JS-only scrolling (window.scrollTo / element.scrollIntoView) moves the
-        DOM scroll position without firing a native 'wheel' event, and this
-        site's infinite-scroll loader only responds to genuine wheel input -
-        so the JS jump alone doesn't trigger loading. Doing it first just
-        gets us near the new content so the wheel scroll that follows only
-        needs to travel a short distance to reach it.
+        JS-only scrolling (window.scrollTo) moves the DOM scroll position
+        without firing a native 'wheel' event, and infinite-scroll loaders
+        commonly only respond to genuine wheel input - so the JS jump alone
+        doesn't reliably trigger loading. Doing it first just gets us near the
+        new content so the wheel scroll that follows only needs to travel a
+        short distance.
         """
-        if indicator_element is not None:
-            self.driver.execute_script(
-                "arguments[0].scrollIntoView({block: 'center'});", indicator_element
-            )
-        else:
-            self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-
+        self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
         ActionChains(self.driver).scroll_by_amount(0, amount).perform()
 
     def _display_all_events_by_scrolling(self):
-        """Loads events by scrolling until no further progress is detected.
-
-        The site's markup for "more events available" has changed before, so
-        completion is checked two ways: the "load more" indicator disappearing
-        (current signal - authoritative when present) and the DATE_BOX count
-        failing to grow for max_stalled_rounds consecutive scrolls (legacy
-        signal, and the fallback when there's no indicator at all). Note the
-        indicator's loaded-date-range text is NOT used as a progress signal:
-        it keeps advancing every scroll even when no new events are actually
-        loaded, which would otherwise mask a stall indefinitely.
+        """Loads events by scrolling until the loaded count matches the page's
+        reported total (authoritative when present) or stalls for
+        max_stalled_rounds consecutive scrolls (fallback for when the total
+        can't be read).
         """
-
-        previous_event_count = len(self.driver.find_elements(By.CSS_SELECTOR, DATE_BOX))
+        previous_count = len(self.driver.find_elements(By.CSS_SELECTOR, EVENT_CARD))
         stalled_rounds = 0
         max_stalled_rounds = 3
         scroll_probe_timeout = min(3, getattr(self, "wait_time", 30))
         probe_wait = WebDriverWait(self.driver, timeout=scroll_probe_timeout)
 
-        def indicator_present():
-            return bool(self.driver.find_elements(By.XPATH, LOAD_MORE_INDICATOR_XPATH))
-
         while True:
-            indicator_elements = self.driver.find_elements(By.XPATH, LOAD_MORE_INDICATOR_XPATH)
-            had_indicator = bool(indicator_elements)
+            total = self._total_events_count()
+            if total is not None and previous_count >= total:
+                logger.debug("Loaded event count matches reported total; all events displayed.")
+                break
 
-            self._scroll_down(indicator_element=indicator_elements[0] if had_indicator else None)
-            logger.debug(f"Scrolled events page: {previous_event_count = }")
+            self._scroll_down()
+            logger.debug(f"Scrolled events page: {previous_count = }")
 
             def progressed(driver):
-                count_grew = (
-                    len(driver.find_elements(By.CSS_SELECTOR, DATE_BOX)) > previous_event_count
-                )
-                indicator_gone = had_indicator and not indicator_present()
-                return count_grew or indicator_gone
+                return len(driver.find_elements(By.CSS_SELECTOR, EVENT_CARD)) > previous_count
 
             try:
                 probe_wait.until(progressed)
@@ -243,13 +253,9 @@ class Website:
                     f"No additional events loaded after scrolling within {scroll_probe_timeout}s."
                 )
 
-            if had_indicator and not indicator_present():
-                logger.debug("Load-more indicator disappeared; all events loaded.")
-                break
+            current_count = len(self.driver.find_elements(By.CSS_SELECTOR, EVENT_CARD))
 
-            current_event_count = len(self.driver.find_elements(By.CSS_SELECTOR, DATE_BOX))
-
-            if current_event_count <= previous_event_count:
+            if current_count <= previous_count:
                 stalled_rounds += 1
                 logger.debug(f"No new events loaded after scroll: {stalled_rounds = }")
                 if stalled_rounds >= max_stalled_rounds:
@@ -260,41 +266,67 @@ class Website:
             else:
                 stalled_rounds = 0
 
-            previous_event_count = current_event_count
+            previous_count = current_count
 
     def _find_event(self, event_date: str, time_range: str):
+        """Finds the event card matching the given date and time range.
+
+        Site-rendered text ('Tue, Sep 1st, 10a - 12p') and user-typed queries
+        ('MON, MAY 5', '9:00am - 10:00am') use different formatting, so both
+        sides are parsed into (month, day) / 24h time tuples and compared
+        structurally rather than by substring matching.
         """
-        Finds an event card based on the provided date and time range.
-        This version searches for a card-like element containing both strings.
-        """
-        # Find the card that contains both the date and time strings.
-        # Using normalize-space and case-insensitive check for classes.
-        xpath = (
-            f"//*[contains(@class, '{EVENT_BOX}') and "
-            f".//h6[contains(normalize-space(.), '{event_date}')] and "
-            f".//h6[contains(normalize-space(.), '{time_range}')]]"
-        )
-        
+        query_date = _parse_month_day(event_date)
+        query_time = _parse_time_range(time_range)
+        if not query_date or not query_time:
+            logger.error(f"Could not parse requested date/time: {event_date!r} {time_range!r}")
+            return None
+
+        def scan(driver):
+            for card in driver.find_elements(By.CSS_SELECTOR, EVENT_CARD):
+                try:
+                    dt_text = card.find_element(By.CSS_SELECTOR, DATE_TIME_SECTION).text
+                except NoSuchElementException:
+                    continue
+                if _parse_month_day(dt_text) == query_date and _parse_time_range(dt_text) == query_time:
+                    return card
+            return False
+
         try:
-            event = self.wait.until(EC.presence_of_element_located((By.XPATH, xpath)))
-            logger.debug(f"Event card found via robust XPath: {event}")
-            return event
-        except Exception:
-            logger.debug("Falling back to sibling-based search for event.")
-            # Fallback to the original sibling-based logic if the above fails
-            date_time_elements = self.wait.until(
-                EC.presence_of_element_located(
-                    (
-                        By.XPATH,
-                        f"//h6[contains(text(), '{event_date}')]/following-sibling::h6[contains(text(), '{time_range}')]",
-                    )
-                )
-            )
-            event = date_time_elements.find_element(
-                By.XPATH,
-                f"./ancestor::*[contains(@class, '{EVENT_BOX}') or contains(@class, 'MuiCard-root')]",
-            )
-            return event
+            return self.wait.until(scan)
+        except TimeoutException:
+            logger.error(f"No event found for date: {event_date}, time range: {time_range}")
+            return None
+
+    def _card_summary(self, event):
+        """Builds a human-readable summary line from an event card's visible fields."""
+        parts = []
+        for selector in (CATEGORY_NAME, EVENT_NAME, COST, SLOTS_INFO):
+            try:
+                text = event.find_element(By.CSS_SELECTOR, selector).text.strip()
+            except NoSuchElementException:
+                continue
+            if text:
+                parts.append(" ".join(text.split()))
+        return " - ".join(parts)
+
+    def _get_skill_restriction(self, details_url):
+        """Reads the skill-level restriction (if any) off an event's details page.
+
+        Only visible on the details page, not the list card, so this costs a
+        navigation. Returns None if the event has no skill restriction at all.
+        """
+        self.driver.get(details_url)
+        self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, EVENT_NAME)))
+        rating_elements = self.driver.find_elements(By.CSS_SELECTOR, RATING_NAMES)
+        return rating_elements[0].text.strip() if rating_elements else None
+
+    def _skill_level_allowed(self, restriction_text):
+        """Checks the configured skill_level against a restriction like 'Intermediate, Advanced'."""
+        if not self.skill_level:
+            logger.warning("No skill_level configured; cannot verify restriction, assuming eligible.")
+            return True
+        return self.skill_level.strip().lower() in restriction_text.lower()
 
     def determine_access_date(
         self, event_date: str, time_range: str, registration_time: datetime = None
@@ -314,119 +346,56 @@ class Website:
             )
             return None, None
 
-        try:
-            # Case-insensitive search using translate
-            # Using . instead of text() to match element content more reliably
-            xpath = ".//*[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'not joinable')]"
-            access_date_element = event.find_element(By.XPATH, xpath)
-            logger.debug("Access date element found.")
-            join_date_text = access_date_element.text
-        except Exception as e:
-            # Check if it's already joinable via a 'JOIN' button
-            try:
-                # Same case-insensitive trick for the join button
-                join_button_xpath = ".//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'join')]"
-                event.find_element(By.XPATH, join_button_xpath)
-                logger.info("Event is already joinable.")
-                
-                # Try to extract additional info if available
-                body_content = ""
-                try:
-                    extra_content = event.find_element(By.CSS_SELECTOR, EXTRA_CONTENT_BOX)
-                    if extra_content:
-                        body_content = extra_content.text.replace("\n", " - ")
-                except:
-                    pass
-                return datetime.now(), body_content
-            except:
-                # Look for eligible tiers if we can't find registration info or join button
-                try:
-                    tier_xpath = ".//*[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'tier')]"
-                    tier_elements = event.find_elements(By.XPATH, tier_xpath)
-                    if tier_elements:
-                        # Get the most descriptive tier-related text (often includes the list of tiers)
-                        tier_info = sorted([el.text.strip() for el in tier_elements if el.text.strip()], key=len, reverse=True)[0]
-                        logger.info(f"Found tier info: {tier_info}")
-                        return None, tier_info
-                except:
-                    pass
-                
-                logger.error("Neither 'not joinable' text, 'JOIN' button, nor tier info found.", exc_info=True)
-                return None, None
-        
-        logger.info("Access date element text: " + join_date_text)
-        
-        date_pattern = r"\b[A-Z][a-z]{2} \d{1,2}\b"
-        match = re.search(date_pattern, join_date_text)
+        # Everything needed from the card must be read now: checking the skill
+        # restriction navigates away from the list page, which would leave
+        # `event` stale.
+        summary = self._card_summary(event)
+        register_label = event.find_element(By.CSS_SELECTOR, REGISTER_BTN).text.strip().lower()
+        details_url = event.find_element(By.CSS_SELECTOR, REGISTER_BTN).get_attribute("href")
+        dropin_elements = event.find_elements(By.CSS_SELECTOR, DROPIN_MSG)
+        dropin_text = dropin_elements[0].text if dropin_elements else None
 
-        if match:
-            date_str = match.group(0)
-            date = datetime.strptime(date_str, "%b %d")
-            logger.debug(f"Extracted date string: {date_str}")
-
-            if registration_time:
-                registration_time = datetime.strptime(
-                    registration_time, "%H:%M:%S"
-                ).time()
-
-                date = date.replace(
-                    hour=registration_time.hour,
-                    minute=registration_time.minute,
-                    second=registration_time.second,
+        restriction = self._get_skill_restriction(details_url) if details_url else None
+        if restriction:
+            summary = f"{summary} - Skill Level Restriction: {restriction}"
+            if not self._skill_level_allowed(restriction):
+                logger.info(
+                    f"Configured skill level '{self.skill_level}' does not meet restriction '{restriction}'."
                 )
-                logger.debug(f"Registration time set: {registration_time}")
+                return None, summary
 
-            now = datetime.now()
+        if register_label and register_label != "details":
+            logger.info(f"Event is already actionable ('{register_label}').")
+            return datetime.now(), summary
 
-            # Adjust the year if the date has already passed this year
-            if date.replace(year=now.year) < now:
-                date = date.replace(year=now.year + 1)
-            else:
-                date = date.replace(year=now.year)
+        if not dropin_text:
+            logger.warning("No 'Registration opens' message found; cannot determine access date.")
+            return None, summary
 
-            logger.info(f"Extracted date: {date}")
-        else:
-            logger.info("No date found in the text.")
-            date = None
+        opens_in = _parse_opens_in(dropin_text)
+        if opens_in is None:
+            logger.warning(f"Could not parse registration-opens message: {dropin_text!r}")
+            return None, summary
 
-        try:
-            extra_content = event.find_element(By.CSS_SELECTOR, EXTRA_CONTENT_BOX)
+        date = datetime.now() + opens_in
+        logger.debug(f"Registration opens in {opens_in}, landing on {date}.")
 
-            # Gather the text content of the remaining first element
-            if extra_content:
-                body_content = extra_content.text.replace("\n", " - ")
-                logger.debug(f"Final body content: {body_content}")
-            else:
-                logger.debug("No nested content elements found.")
-                body_content = ""
-        except:
-            body_content = ""
+        if registration_time:
+            reg_time = datetime.strptime(registration_time, "%H:%M:%S").time()
+            date = date.replace(
+                hour=reg_time.hour,
+                minute=reg_time.minute,
+                second=reg_time.second,
+                microsecond=0,
+            )
+            logger.debug(f"Registration time set: {reg_time}")
 
-        return date, body_content
+        logger.info(f"Extracted date: {date}")
+        return date, summary
 
     def get_event_url(self, event_date: str, time_range: str):
-        """Finds the share button for the specified event."""
-        logger.info(f"Finding share button for event: {event_date}, {time_range}")
-
-        def _click_modal_element(xpath_candidates):
-            for xpath in xpath_candidates:
-                try:
-                    element = self.wait.until(
-                        EC.presence_of_element_located((By.XPATH, xpath))
-                    )
-                    try:
-                        WebDriverWait(self.driver, self.wait_time).until(
-                            EC.element_to_be_clickable((By.XPATH, xpath))
-                        )
-                        element.click()
-                    except Exception:
-                        # MUI overlays can block native Selenium clicks; JS click is a safe fallback.
-                        self.driver.execute_script("arguments[0].click();", element)
-                    logger.debug(f"Clicked modal element via XPath: {xpath}")
-                    return True
-                except Exception:
-                    continue
-            return False
+        """Finds the persistent details-page URL for the specified event."""
+        logger.info(f"Finding event URL for event: {event_date}, {time_range}")
 
         self.display_all_events()
         event = self._find_event(event_date, time_range)
@@ -437,111 +406,68 @@ class Website:
             )
             return None
 
-        try:
-            share_button = WebDriverWait(event, self.wait_time).until(
-                EC.element_to_be_clickable(
-                    (
-                        By.XPATH,
-                        ".//button[contains(@aria-label, 'Share event')]",
-                    )
-                )
-            )
-            logger.debug("Share button found.")
+        href = event.find_element(By.CSS_SELECTOR, REGISTER_BTN).get_attribute("href")
 
-            # Inject clipboard write interceptor (thread-safe, per-browser-instance)
-            self.driver.execute_script("""
-                window.__interceptedClipboard = null;
-                if (!window.__clipboardInterceptorInstalled && navigator.clipboard && navigator.clipboard.writeText) {
-                    const origWrite = navigator.clipboard.writeText.bind(navigator.clipboard);
-                    navigator.clipboard.writeText = function(text) {
-                        window.__interceptedClipboard = text;
-                        return origWrite(text);
-                    };
-                    window.__clipboardInterceptorInstalled = true;
-                }
-            """)
+        if href:
+            logger.info(f"Extracted event URL: {href}")
+        else:
+            logger.warning("Register link had no href; could not extract event URL.")
 
-            share_button.click()
+        return href
 
-            # Modal step 1: select the share scope option "This event only"
-            scope_option_xpaths = [
-                "//span[contains(@class, 'MuiFormControlLabel-label') and normalize-space(.)='This event only']/ancestor::label[1]",
-                "//span[contains(@class, 'MuiFormControlLabel-label') and normalize-space(.)='This event only']",
-                "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'this event only')]",
-                "//label[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'this event only')]",
-                "//*[contains(@role, 'option') and contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'this event only')]",
-            ]
-
-            scope_selected = _click_modal_element(scope_option_xpaths)
-
-            if not scope_selected:
-                logger.warning("Could not explicitly select 'This event only' option; continuing.")
-
-            # Modal step 2: click "Copy link"
-            copy_link_xpaths = [
-                "//button[normalize-space(.)='Copy link']",
-                "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'copy link')]",
-                "//*[@role='button' and contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'copy link')]",
-            ]
-
-            copy_clicked = _click_modal_element(copy_link_xpaths)
-
-            if not copy_clicked:
-                logger.error("Could not find or click 'Copy link' button.")
-                return None
-
-            # Read the intercepted clipboard value from the browser's JS context
-            event_url = WebDriverWait(self.driver, self.wait_time).until(
-                lambda d: d.execute_script("return window.__interceptedClipboard;")
-            )
-
-            if event_url:
-                logger.info(f"Extracted event URL: {event_url}")
-            else:
-                logger.warning("Failed to intercept event URL from clipboard.")
-
-            return event_url
-        except Exception as e:
-            logger.error("Share button not found or clipboard intercept failed.", exc_info=True)
-            return None
-    
     def register_for_event(self, event_date: str, time_range: str, event_url: str):
         """Registers for the event."""
 
         if event_url:
             logger.info(f"Navigating to event URL: {event_url}")
             self.driver.get(event_url)
+            register_link = self.wait.until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, REGISTER_BTN))
+            )
         else:
             self.display_all_events()
+            event = self._find_event(event_date, time_range)
+            register_link = event.find_element(By.CSS_SELECTOR, REGISTER_BTN)
 
-        event = self._find_event(event_date, time_range)
-
-        join_button = WebDriverWait(event, self.wait_time).until(
-            EC.element_to_be_clickable(
-                (
-                    By.XPATH,
-                    ".//button[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'join')]",
-                )
+        signup_url = register_link.get_attribute("href")
+        if not signup_url:
+            raise RuntimeError(
+                f"Register link has no destination for {event_date} {time_range}; "
+                "event may already be closed."
             )
-        )
 
-        logger.debug(f"Join button found for user '{self.user_tag}'.")
+        # This is a plain href, not an SPA action, so following it directly
+        # sidesteps click-interception entirely instead of fighting overlays.
+        self.driver.get(signup_url)
+        logger.debug(f"Navigated to signup page: {signup_url}")
 
-        # Scroll the button to the center of the viewport so a sticky header/app
-        # bar (e.g. MuiStack-root) doesn't overlap it and intercept the click.
-        self.driver.execute_script(
-            "arguments[0].scrollIntoView({block: 'center'});", join_button
-        )
+        def signup_outcome(driver):
+            ineligible = driver.find_elements(By.XPATH, INELIGIBLE_XPATH)
+            if ineligible:
+                return "ineligible", ineligible[0]
+            save_buttons = driver.find_elements(By.CSS_SELECTOR, SAVE_BTN)
+            if save_buttons:
+                return "ready", save_buttons[0]
+            return False
+
+        kind, element = self.wait.until(signup_outcome)
+
+        if kind == "ineligible":
+            message = element.text.strip()
+            logger.error(f"Cannot register for event (user '{self.user_tag}'): {message}")
+            raise RuntimeError(f"Cannot register for event: {message}")
+
+        logger.debug(f"Finalize-registration button found for user '{self.user_tag}'.")
 
         try:
-            join_button.click()
+            element.click()
         except ElementClickInterceptedException:
             logger.warning(
-                "Native click on join button was intercepted; falling back to JS click."
+                "Native click on finalize button was intercepted; falling back to JS click."
             )
-            self.driver.execute_script("arguments[0].click();", join_button)
+            self.driver.execute_script("arguments[0].click();", element)
 
-        logger.info(f"Clicked join button for user '{self.user_tag}'.")
+        logger.info(f"Clicked finalize-registration button for user '{self.user_tag}'.")
 
         time.sleep(30)
         logger.info(f"Successfully registered for the event (user '{self.user_tag}').")
@@ -550,11 +476,3 @@ class Website:
         """Closes the browser."""
         logger.info("Closing the web driver.")
         self.driver.quit()
-
-
-# Example usage:
-# interactor = WebsiteInteractor()
-# interactor.log_in("https://example.com/login", "user@example.com", "securepassword123")
-# access_date = interactor.determine_access_date("https://example.com/event")
-# interactor.register_for_event("https://example.com/event")
-# interactor.close()
