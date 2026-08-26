@@ -34,9 +34,11 @@ class FakeEmailClient:
         self.user = "robin.pickleball.scheduler@gmail.com"
 
         self.replied_ids = []
+        self.reply_bodies = []
         self.marked_read_ids = []
         self.archived_ids = []
         self.deleted_ids = []
+        self.notifications = []
 
     def authenticate_email(self):
         return None
@@ -58,6 +60,10 @@ class FakeEmailClient:
 
     def reply_to_email(self, email, reply_plaintext, reply_html=None, subject=None, user_tag=None):
         self.replied_ids.append(email.id)
+        self.reply_bodies.append(reply_plaintext)
+
+    def send_notification(self, subject, body, user_tag=None):
+        self.notifications.append((subject, body))
 
     @staticmethod
     def extract_email_address(addresses):
@@ -131,3 +137,46 @@ def test_validate_user_tag_failure_is_archived_not_deleted(monkeypatch):
     assert fake_client.marked_read_ids == ["invalid-user-1"]
     assert fake_client.archived_ids == ["invalid-user-1"]
     assert fake_client.deleted_ids == []
+
+
+class FakeWebsiteIneligible:
+    """A skill-level mismatch: determine_access_date raises instead of returning."""
+
+    def __init__(self, headless=True):
+        pass
+
+    def login(self, user_tag=None):
+        pass
+
+    def determine_access_date(self, event_date, time_range):
+        raise main.SkillLevelIneligible(
+            "That's a Beginner skill level session, current settings list you as Intermediate."
+        )
+
+    def close(self):
+        pass
+
+
+def test_skill_level_ineligible_replies_politely_without_failure_notification(monkeypatch):
+    emails = [_make_email("add-1", subject="", body="Wed, Sep 2nd, 1p - 2:30p")]
+    fake_client = FakeEmailClient(emails=emails, sender_authorized=True)
+
+    monkeypatch.setattr(main, "EmailClient", lambda: fake_client)
+    monkeypatch.setattr(main, "Events", FakeEvents)
+    monkeypatch.setattr(main, "extract_user_tag", lambda *_args, **_kwargs: "default")
+    monkeypatch.setattr(main, "validate_user_tag", lambda user_tag: user_tag)
+    monkeypatch.setattr(main, "is_sender_allowed", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        main, "extract_user_intent", lambda _email: ("add", ("Wed, Sep 2nd", "1p - 2:30p"))
+    )
+    monkeypatch.setattr(main, "Website", FakeWebsiteIneligible)
+
+    main.check_for_new_event(headless=True)
+
+    assert fake_client.replied_ids == ["add-1"]
+    assert fake_client.reply_bodies == [
+        "That's a Beginner skill level session, current settings list you as Intermediate."
+    ]
+    assert fake_client.marked_read_ids == ["add-1"]
+    assert fake_client.archived_ids == ["add-1"]
+    assert fake_client.notifications == []

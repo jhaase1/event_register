@@ -107,6 +107,14 @@ def _parse_opens_in(text):
     return timedelta(**kwargs)
 
 
+class SkillLevelIneligible(Exception):
+    """Raised when an event's skill-level restriction excludes the configured skill_level.
+
+    Kept separate from the generic "couldn't determine registration time" outcome
+    so callers can reply politely instead of treating this as a system failure.
+    """
+
+
 class Website:
     def __init__(self, headless=True, wait_time=30):
         """Initializes the web driver for the website interaction.
@@ -362,7 +370,9 @@ class Website:
                 logger.info(
                     f"Configured skill level '{self.skill_level}' does not meet restriction '{restriction}'."
                 )
-                return None, summary
+                raise SkillLevelIneligible(
+                    f"That's a {restriction} skill level session, current settings list you as {self.skill_level}."
+                )
 
         if register_label and register_label != "details":
             logger.info(f"Event is already actionable ('{register_label}').")
