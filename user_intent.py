@@ -78,8 +78,15 @@ def extract_event_details(text):
     Returns:
     A tuple containing the date and the time range if found, otherwise None.
     """
-    # Regex pattern to match the date and time range format
-    pattern = re.compile(r'(?P<date>\b([A-Z]{3},)?\s[A-Z]{3,9}\s\d{1,2}\b)\s*(?P<time_range>\d{1,2}:\d{2}(?:[ap]m)?\s-\s\d{1,2}:\d{2}(?:[ap]m)?)')
+    # Case-insensitive and tolerant of ordinal suffixes ("2nd") and abbreviated,
+    # colon-less times ("1p - 2:30p") since those show up verbatim when users
+    # copy an event's date/time straight off the CourtReserve site.
+    date_pattern = r'(?:[A-Za-z]{3},\s*)?[A-Za-z]{3,9}\.?\s+\d{1,2}(?:st|nd|rd|th)?'
+    time_pattern = r'\d{1,2}(?::\d{2})?\s*(?:[ap]\.?m?\.?)?\s*-\s*\d{1,2}(?::\d{2})?\s*[ap]\.?m?\.?'
+    pattern = re.compile(
+        rf'(?P<date>{date_pattern})\s*,?\s*(?P<time_range>{time_pattern})',
+        re.IGNORECASE,
+    )
     match = pattern.search(text)
 
     if match:
