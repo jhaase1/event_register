@@ -28,12 +28,12 @@ def _make_site(event):
 
 
 def test_get_event_url_returns_register_link_href():
-    register_btn = FakeElement(text="Register", href="https://app.courtreserve.com/Online/Events/Details/19992/ABC123")
+    register_btn = FakeElement(text="Register", href="https://events.example.com/Online/Events/Details/19992/ABC123")
     site = _make_site(FakeEvent(register_btn))
 
     event_url = site.get_event_url("MON, MAY 5", "9:00am - 10:00am")
 
-    assert event_url == "https://app.courtreserve.com/Online/Events/Details/19992/ABC123"
+    assert event_url == "https://events.example.com/Online/Events/Details/19992/ABC123"
 
 
 def test_get_event_url_returns_none_when_no_event_found():

@@ -79,7 +79,7 @@ def _make_site(driver, event):
 
 def test_register_for_event_falls_back_to_js_click_when_intercepted(monkeypatch):
     save_btn = FakeElement(raise_on_click=ElementClickInterceptedException("intercepted"))
-    register_btn = FakeElement(text="Register", href="https://app.courtreserve.com/Online/Events/SignUpToEvent/19992?eventId=1")
+    register_btn = FakeElement(text="Register", href="https://events.example.com/Online/Events/SignUpToEvent/19992?eventId=1")
     driver = FakeDriver(save_btn=save_btn)
     monkeypatch.setattr(website.time, "sleep", lambda *_args, **_kwargs: None)
 
@@ -87,14 +87,14 @@ def test_register_for_event_falls_back_to_js_click_when_intercepted(monkeypatch)
 
     site.register_for_event("MON, MAY 5", "9:00am - 10:00am", event_url=None)
 
-    assert driver.gotten_urls == ["https://app.courtreserve.com/Online/Events/SignUpToEvent/19992?eventId=1"]
+    assert driver.gotten_urls == ["https://events.example.com/Online/Events/SignUpToEvent/19992?eventId=1"]
     assert driver.js_clicked_elements == [save_btn]
     assert save_btn.click_calls == 2
 
 
 def test_register_for_event_uses_native_click_when_not_intercepted(monkeypatch):
     save_btn = FakeElement()
-    register_btn = FakeElement(text="Register", href="https://app.courtreserve.com/Online/Events/SignUpToEvent/19992?eventId=1")
+    register_btn = FakeElement(text="Register", href="https://events.example.com/Online/Events/SignUpToEvent/19992?eventId=1")
     driver = FakeDriver(save_btn=save_btn)
     monkeypatch.setattr(website.time, "sleep", lambda *_args, **_kwargs: None)
 
@@ -108,7 +108,7 @@ def test_register_for_event_uses_native_click_when_not_intercepted(monkeypatch):
 
 def test_register_for_event_navigates_directly_to_event_url_when_given(monkeypatch):
     save_btn = FakeElement()
-    register_btn = FakeElement(text="Register", href="https://app.courtreserve.com/Online/Events/SignUpToEvent/19992?eventId=1")
+    register_btn = FakeElement(text="Register", href="https://events.example.com/Online/Events/SignUpToEvent/19992?eventId=1")
     driver = FakeDriver(save_btn=save_btn)
     monkeypatch.setattr(website.time, "sleep", lambda *_args, **_kwargs: None)
 
@@ -123,18 +123,18 @@ def test_register_for_event_navigates_directly_to_event_url_when_given(monkeypat
 
     monkeypatch.setattr(website.EC, "presence_of_element_located", fake_presence)
 
-    event_url = "https://app.courtreserve.com/Online/Events/Details/19992/ABC123"
+    event_url = "https://events.example.com/Online/Events/Details/19992/ABC123"
     site.register_for_event("MON, MAY 5", "9:00am - 10:00am", event_url=event_url)
 
     assert driver.gotten_urls == [
         event_url,
-        "https://app.courtreserve.com/Online/Events/SignUpToEvent/19992?eventId=1",
+        "https://events.example.com/Online/Events/SignUpToEvent/19992?eventId=1",
     ]
     assert save_btn.click_calls == 1
 
 
 def test_register_for_event_raises_when_ineligible(monkeypatch):
-    register_btn = FakeElement(text="Register", href="https://app.courtreserve.com/Online/Events/SignUpToEvent/19992?eventId=1")
+    register_btn = FakeElement(text="Register", href="https://events.example.com/Online/Events/SignUpToEvent/19992?eventId=1")
     driver = FakeDriver(ineligible_text="You are not eligible. See restrictions below.")
     monkeypatch.setattr(website.time, "sleep", lambda *_args, **_kwargs: None)
 

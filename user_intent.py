@@ -80,7 +80,7 @@ def extract_event_details(text):
     """
     # Case-insensitive and tolerant of ordinal suffixes ("2nd") and abbreviated,
     # colon-less times ("1p - 2:30p") since those show up verbatim when users
-    # copy an event's date/time straight off the CourtReserve site.
+    # copy an event's date/time straight off the events website.
     date_pattern = r'(?:[A-Za-z]{3},\s*)?[A-Za-z]{3,9}\.?\s+\d{1,2}(?:st|nd|rd|th)?'
     time_pattern = r'\d{1,2}(?::\d{2})?\s*(?:[ap]\.?m?\.?)?\s*-\s*\d{1,2}(?::\d{2})?\s*[ap]\.?m?\.?'
     pattern = re.compile(

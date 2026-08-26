@@ -23,7 +23,7 @@ from user_config import get_website_token_file
 logger = get_logger(__name__)
 logger.setLevel("DEBUG")
 
-# CourtReserve renders these as stable QA hooks across the member portal, so we
+# The site renders these as stable QA hooks across the member portal, so we
 # prefer them over CSS classes (which are generated/hashed and churn on rebuilds).
 EVENT_CARD = "[data-testid='event-card']"
 EVENTS_COUNT_SPAN = "#events-count-span"

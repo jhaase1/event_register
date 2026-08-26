@@ -17,7 +17,7 @@ class FakeElement:
 class FakeEvent:
     """Stands in for an event-card element found on the events list page."""
 
-    def __init__(self, register_label="register", dropin_text=None, href="https://app.courtreserve.com/Online/Events/Details/19992/ABC"):
+    def __init__(self, register_label="register", dropin_text=None, href="https://events.example.com/Online/Events/Details/19992/ABC"):
         self._register_btn = FakeElement(text=register_label, href=href)
         self._dropin = [FakeElement(text=dropin_text)] if dropin_text is not None else []
 
