@@ -2,7 +2,7 @@ import textile
 from tabulate import tabulate
 import json
 from events import Events
-from website import Website
+from website import Website, SkillLevelIneligible
 from dwell import dwell_until, is_within_offset
 from email_client import EmailClient
 from user_intent import extract_user_intent
@@ -302,9 +302,19 @@ def check_for_new_event(headless=True):
                 websites[user_tag] = Website(headless=headless)
             website = websites[user_tag]
             website.login(user_tag=user_tag)
-            registration_time, additional_info = website.determine_access_date(
-                event_date, time_range
-            )
+
+            try:
+                registration_time, additional_info = website.determine_access_date(
+                    event_date, time_range
+                )
+            except SkillLevelIneligible as e:
+                logger.info(
+                    f"Event not eligible for user '{user_tag}' due to skill level: {e}"
+                )
+                email_client.reply_to_email(email, str(e), user_tag=user_tag)
+                email_client.mark_email_as_read(email)
+                email_client.archive_email(email)
+                continue
 
             if registration_time is None:
                 logger.info(

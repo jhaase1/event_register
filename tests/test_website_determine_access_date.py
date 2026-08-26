@@ -93,14 +93,21 @@ def test_matching_skill_restriction_still_actionable(monkeypatch):
     assert "Skill Level Restriction: Intermediate, Advanced" in summary
 
 
-def test_mismatched_skill_restriction_blocks_registration(monkeypatch):
+def test_mismatched_skill_restriction_raises_ineligible_with_polite_message(monkeypatch):
+    """A skill-level mismatch is an expected outcome, not a system failure, so it
+    raises a distinct exception rather than returning the generic None/None used
+    for "couldn't figure this event out at all" - callers can catch it separately
+    and reply politely instead of treating it as an error."""
     event = FakeEvent(register_label="Register")
     site = _make_site(monkeypatch, event, restriction_text="Beginner", skill_level="Intermediate")
 
-    date, summary = site.determine_access_date("SEP 1", "10:00am - 12:00pm")
-
-    assert date is None
-    assert "Skill Level Restriction: Beginner" in summary
+    try:
+        site.determine_access_date("SEP 1", "10:00am - 12:00pm")
+        assert False, "expected SkillLevelIneligible"
+    except website.SkillLevelIneligible as e:
+        assert str(e) == (
+            "That's a Beginner skill level session, current settings list you as Intermediate."
+        )
 
 
 def test_no_skill_level_configured_assumes_eligible(monkeypatch):
