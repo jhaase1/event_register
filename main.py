@@ -89,6 +89,10 @@ MAX_DELAY = APP_CONFIG["max_delay_seconds"]  # seconds
 
 cleanup_days = APP_CONFIG["cleanup_days"]  # days to keep events in the database
 
+# A registration time this close is treated as already open: it would slip
+# into the past before register_for_next_event looks for future times.
+ALREADY_OPEN_MARGIN = timedelta(minutes=1)
+
 
 def register_for_single_event(
     event_info, headless=True, results=None, results_lock=None
@@ -467,7 +471,108 @@ def _handle_unlisted_request(events, website, email, user_tag, event_date, time_
     return reply
 
 
-def check_for_new_event(headless=True):
+def _attempt_open_registration(item, headless):
+    """Registers for one queued already-open event. Returns its results list."""
+    # Never earlier than the real opening; register_for_single_event then
+    # waits for it the same way the scheduler does.
+    registration_time = max(item["registration_time"], datetime.now()).replace(microsecond=0)
+    item["registration_time"] = registration_time
+    results = []
+    register_for_single_event(
+        {
+            "event_date": item["event_date"],
+            "time_range": item["time_range"],
+            "registration_time": registration_time,
+            "user_tag": item["user_tag"],
+        },
+        headless=headless,
+        results=results,
+    )
+    return results
+
+
+def register_open_events(pending, headless=True):
+    """Registers events that were already open (or about to open) when emailed.
+
+    check_for_new_event only queues these. They run after
+    register_for_next_event so that these ad-hoc registrations, each a minute
+    or two of browser work, never push a scheduled registration past its hold
+    window.
+    """
+    if not pending:
+        return
+    logger.info(f"Registering {len(pending)} already-open event(s) from email.")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(pending), 4)) as executor:
+        all_results = list(
+            executor.map(lambda item: _attempt_open_registration(item, headless), pending)
+        )
+
+    # Database and Gmail work stays on this thread: the sqlite connection
+    # can't be shared across threads.
+    events = Events()
+    try:
+        email_client = EmailClient()
+    except Exception:
+        logger.exception("Could not create email client for already-open replies")
+        email_client = None
+
+    failed = []
+    for item, results in zip(pending, all_results):
+        event_date, time_range, user_tag = item["event_date"], item["time_range"], item["user_tag"]
+        additional_info = item["additional_info"]
+
+        if any(r["success"] for r in results):
+            # Recorded so the report shows it; its time is already past, so
+            # the scheduler won't try it again.
+            events.insert_event(
+                event_date=event_date,
+                time_range=time_range,
+                registration_time=item["registration_time"],
+                user_tag=user_tag,
+                additional_info=additional_info,
+            )
+            reply = "Registration was already open, so I registered you right away."
+            subject = f"Event Registration Confirmation: {event_date} {time_range}"
+        else:
+            failed.extend(r for r in results if not r["success"])
+            reply = (
+                "Registration was already open, but my attempt to register didn't go through. "
+                "Please check the website."
+            )
+            subject = f"Event Registration: {event_date} {time_range}"
+
+        if additional_info:
+            reply += f"\n\nAdditional info: {additional_info}"
+
+        if email_client is None:
+            continue
+        try:
+            email_client.reply_to_email(
+                item["email"],
+                reply_plaintext=reply,
+                reply_html=textile.textile(reply),
+                subject=subject,
+                user_tag=user_tag,
+            )
+        except Exception:
+            logger.exception(f"Failed to reply about {event_date} {time_range} for '{user_tag}'")
+
+    events.close()
+    _notify_registration_failures(failed, headless)
+
+
+def check_for_new_event(headless=True, pending_open=None):
+    """Processes command emails.
+
+    Events that are already open are appended to `pending_open` for the caller
+    to register later (see register_open_events). Appending as we go keeps
+    them even if a later email raises. Without a list, they're registered at
+    the end of this call.
+    """
+    register_open_now = pending_open is None
+    if register_open_now:
+        pending_open = []
     logger.info("Checking for new events via email.")
     email_client = EmailClient()
     email_client.authenticate_email()
@@ -626,6 +731,26 @@ def check_for_new_event(headless=True):
                     logger.exception(
                         "Failed to send failure notification for undetermined registration time"
                     )
+            elif registration_time <= datetime.now() + ALREADY_OPEN_MARGIN:
+                # determine_access_date returns "now" when the event is already
+                # open. Storing that (or a time seconds away, which slips into
+                # the past while later emails are processed) would never
+                # register: the scheduler only picks up future times. Queue it;
+                # the email is marked read below, before any registration.
+                logger.info(
+                    f"Registration open or about to open for user '{user_tag}': "
+                    f"{event_date} {time_range}; queued."
+                )
+                pending_open.append(
+                    {
+                        "email": email,
+                        "user_tag": user_tag,
+                        "event_date": event_date,
+                        "time_range": time_range,
+                        "additional_info": additional_info,
+                        "registration_time": registration_time,
+                    }
+                )
             else:
                 logger.debug(
                     f"Inserting {event_date, time_range} into database at {registration_time} for user '{user_tag}'"
@@ -734,6 +859,10 @@ def check_for_new_event(headless=True):
         except Exception as e:
             logger.error(f"Error closing website for user '{tag}': {e}")
     events.close()
+
+    if register_open_now:
+        register_open_events(pending_open, headless=headless)
+
 
 def _drop_speculative(events, email_client, row, message):
     logger.info(f"Dropping speculative event {row['event_date']} {row['time_range']} for '{row['user_tag']}'.")
@@ -976,6 +1105,29 @@ def _refresh_schedule_and_confirm_speculative(headless):
     events.close()
 
 
+def run(headless):
+    """One cron cycle: read email, run scheduled registrations, then
+    register anything that was already open when emailed."""
+    pending_open = []
+    try:
+        check_for_new_event(headless=headless, pending_open=pending_open)
+    except Exception as e:
+        logger.error(f"An error occurred: {e}")
+
+    try:
+        register_for_next_event(headless=headless)
+    except Exception as e:
+        logger.error(f"Scheduled registration failed: {e}", exc_info=True)
+
+    register_open_events(pending_open, headless=headless)
+
+    # Runs last so a slow scan never delays an imminent hold.
+    try:
+        refresh_schedule_and_confirm_speculative(headless=headless)
+    except Exception as e:
+        logger.error(f"Speculative refresh failed: {e}", exc_info=True)
+
+
 def _format_failure_body(context: dict, headless_flag: bool = True) -> str:
     """Build a generalized failure body from a context dictionary.
 
@@ -1003,16 +1155,4 @@ def _format_failure_body(context: dict, headless_flag: bool = True) -> str:
 
 
 if __name__ == "__main__":
-
-    try:
-        check_for_new_event(headless=headless)
-    except Exception as e:
-        logger.error(f"An error occurred: {e}")
-
-    register_for_next_event(headless=headless)
-
-    # Runs after registration so a slow scan never delays an imminent hold.
-    try:
-        refresh_schedule_and_confirm_speculative(headless=headless)
-    except Exception as e:
-        logger.error(f"Speculative refresh failed: {e}", exc_info=True)
+    run(headless=headless)
