@@ -197,31 +197,89 @@ def register_for_next_event(headless=True):
         logger.info(
             f"Registration complete: {len(succeeded)} succeeded, {len(failed)} failed."
         )
-    if failed:
-        try:
-            notifier = EmailClient()
-            for f in failed:
-                logger.error(
-                    f"FAILED: user '{f['user_tag']}' for {f['event']}: {f['error']}"
-                )
-                ctx = {
-                    "user_tag": f.get("user_tag"),
-                    "event": f.get("event"),
-                    "registration_time": f.get("registration_time"),
-                    "error": f.get("error"),
-                    "traceback": f.get("traceback"),
-                }
-                notifier.send_notification(
-                    subject="Event registration failed",
-                    body=_format_failure_body(ctx, headless_flag=headless),
-                    user_tag=f["user_tag"],
-                )
-        except Exception as e:
-            logger.error(f"Failed to send failure notifications: {e}", exc_info=True)
+
+    _notify_registration_failures(failed, headless)
 
     logger.info("Removing old events from the database.")
     events.remove_old_events(n_days=cleanup_days)
     events.close()
+
+
+def _notify_registration_failures(failed, headless):
+    if not failed:
+        return
+    try:
+        notifier = EmailClient()
+        for f in failed:
+            logger.error(
+                f"FAILED: user '{f['user_tag']}' for {f['event']}: {f['error']}"
+            )
+            ctx = {
+                "user_tag": f.get("user_tag"),
+                "event": f.get("event"),
+                "registration_time": f.get("registration_time"),
+                "error": f.get("error"),
+                "traceback": f.get("traceback"),
+            }
+            notifier.send_notification(
+                subject="Event registration failed",
+                body=_format_failure_body(ctx, headless_flag=headless),
+                user_tag=f["user_tag"],
+            )
+    except Exception as e:
+        logger.error(f"Failed to send failure notifications: {e}", exc_info=True)
+
+
+def _register_open_event_now(
+    email_client, email, events, user_tag, event_date, time_range, additional_info, headless
+):
+    """Registers right away for an event whose registration is already open."""
+    logger.info(
+        f"Registration already open for user '{user_tag}': {event_date} {time_range}; registering now."
+    )
+    registration_time = datetime.now().replace(microsecond=0)
+    results = []
+    register_for_single_event(
+        {
+            "event_date": event_date,
+            "time_range": time_range,
+            "registration_time": registration_time,
+            "user_tag": user_tag,
+        },
+        headless=headless,
+        results=results,
+    )
+
+    if any(r["success"] for r in results):
+        # Recorded so the report shows it; its time is already past, so the
+        # scheduler won't try it again.
+        events.insert_event(
+            event_date=event_date,
+            time_range=time_range,
+            registration_time=registration_time,
+            user_tag=user_tag,
+            additional_info=additional_info,
+        )
+        reply = "Registration was already open, so I registered you right away."
+        subject = f"Event Registration Confirmation: {event_date} {time_range}"
+    else:
+        reply = (
+            "Registration was already open, but my attempt to register didn't go through. "
+            "Please check the website."
+        )
+        subject = f"Event Registration: {event_date} {time_range}"
+        _notify_registration_failures([r for r in results if not r["success"]], headless)
+
+    if additional_info:
+        reply += f"\n\nAdditional info: {additional_info}"
+
+    email_client.reply_to_email(
+        email,
+        reply_plaintext=reply,
+        reply_html=textile.textile(reply),
+        subject=subject,
+        user_tag=user_tag,
+    )
 
 
 def check_for_new_event(headless=True):
@@ -343,6 +401,20 @@ def check_for_new_event(headless=True):
                     logger.exception(
                         "Failed to send failure notification for undetermined registration time"
                     )
+            elif registration_time <= datetime.now():
+                # determine_access_date returns "now" when the event is already
+                # open. Storing that would never register: the scheduler only
+                # picks up registration times still in the future.
+                _register_open_event_now(
+                    email_client,
+                    email,
+                    events,
+                    user_tag,
+                    event_date,
+                    time_range,
+                    additional_info,
+                    headless,
+                )
             else:
                 logger.debug(
                     f"Inserting {event_date, time_range} into database at {registration_time} for user '{user_tag}'"
