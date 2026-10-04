@@ -61,13 +61,16 @@ def parse_request(event_date, time_range, today):
     return resolve_year(*month_day, today), hm_pair(time_tuple)
 
 
-def to_observation(card, now):
+def to_observation(card, now, trust_first_seen=True):
     """Converts a scanned event card into an observed_events row.
 
     lead_days is the gap between registration opening and the event:
     exact when a countdown is shown, and only an estimate ('first_seen')
     when the card is already open the first time we see it - in that case
     it opened at or before now, so the estimate can only be too small.
+
+    trust_first_seen should be False when there was no recent earlier scan:
+    an open card on the very first scan may have been open for days.
     """
     if not card.get("month_day") or not card.get("time"):
         return None
@@ -79,7 +82,7 @@ def to_observation(card, now):
     if card.get("opens_in") is not None:
         opens_at = now + card["opens_in"]
         lead_days, lead_source = (event_day - opens_at.date()).days, "countdown"
-    elif card.get("actionable"):
+    elif card.get("actionable") and trust_first_seen:
         lead_days, lead_source = (event_day - now.date()).days, "first_seen"
 
     return {

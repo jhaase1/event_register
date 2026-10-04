@@ -318,14 +318,29 @@ def _reply_to_request(email_client, request_ref, body, user_tag, subject=None):
 
 
 def _record_listing(events, website, user_tag, now):
-    """Saves every card on the already-loaded events list as schedule history."""
+    """Saves every card on the already-loaded events list as schedule history.
+
+    Returns the scanned cards and their observations (empty on failure).
+    """
     try:
+        # A card that's already open is only a meaningful "first sighting" if a
+        # recent earlier scan would have caught it before it was posted.
+        last = events.get_last_snapshot(user_tag)
+        trust_first_seen = last is not None and now - last <= timedelta(
+            hours=2 * APP_CONFIG["snapshot_interval_hours"]
+        )
         cards = website.scan_listed_events()
-        observations = [o for o in (schedule.to_observation(c, now) for c in cards) if o]
+        observations = [
+            schedule.to_observation(c, now, trust_first_seen=trust_first_seen) for c in cards
+        ]
+        cards = [c for c, o in zip(cards, observations) if o]
+        observations = [o for o in observations if o]
         events.upsert_observations(user_tag, observations, seen_at=now)
         events.record_snapshot(user_tag, now)
+        return cards, observations
     except Exception:
         logger.exception(f"Failed to record event listing for user '{user_tag}'")
+        return [], []
 
 
 def _handle_unlisted_request(events, website, email, user_tag, event_date, time_range):

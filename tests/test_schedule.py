@@ -107,6 +107,18 @@ def test_to_observation_estimates_lead_from_first_sighting_when_already_open():
     assert obs["lead_source"] == "first_seen"
 
 
+def test_to_observation_ignores_first_sighting_when_untrusted():
+    # On the very first scan an open card may have been open for days.
+    obs = schedule.to_observation(_card(actionable=True), NOW, trust_first_seen=False)
+    assert obs["lead_days"] is None
+    assert obs["lead_source"] is None
+
+
+def test_to_observation_countdown_lead_kept_when_first_seen_untrusted():
+    obs = schedule.to_observation(_card(opens_in=timedelta(days=2, hours=1)), NOW, trust_first_seen=False)
+    assert (obs["lead_days"], obs["lead_source"]) == (7, "countdown")
+
+
 def test_to_observation_without_countdown_or_open_has_no_lead():
     obs = schedule.to_observation(_card(), NOW)
     assert obs["lead_days"] is None

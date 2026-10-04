@@ -290,6 +290,45 @@ def test_refresh_snapshots_stale_users(refresh_env):
     assert len(refresh_env.site.instances) == 1
 
 
+def test_first_ever_snapshot_does_not_trust_open_cards_as_first_sightings(refresh_env):
+    refresh_env.site.cards = [_card(TODAY + timedelta(days=3), actionable=True)]
+
+    main.refresh_schedule_and_confirm_speculative(headless=True)
+
+    db = _open(refresh_env.db_path)
+    obs = db.get_observations("default", since=TODAY)[0]
+    db.close()
+    assert (obs["lead_days"], obs["lead_source"]) == (None, None)
+
+
+def test_snapshot_after_recent_scan_records_first_sighting_lead(refresh_env):
+    db = _open(refresh_env.db_path)
+    db.record_snapshot("default", datetime.now() - timedelta(hours=7))
+    db.close()
+    refresh_env.site.cards = [_card(TODAY + timedelta(days=3), actionable=True)]
+
+    main.refresh_schedule_and_confirm_speculative(headless=True)
+
+    db = _open(refresh_env.db_path)
+    obs = db.get_observations("default", since=TODAY)[0]
+    db.close()
+    assert (obs["lead_days"], obs["lead_source"]) == (3, "first_seen")
+
+
+def test_snapshot_after_long_gap_does_not_trust_first_sightings(refresh_env):
+    db = _open(refresh_env.db_path)
+    db.record_snapshot("default", datetime.now() - timedelta(days=3))
+    db.close()
+    refresh_env.site.cards = [_card(TODAY + timedelta(days=3), actionable=True)]
+
+    main.refresh_schedule_and_confirm_speculative(headless=True)
+
+    db = _open(refresh_env.db_path)
+    obs = db.get_observations("default", since=TODAY)[0]
+    db.close()
+    assert obs["lead_days"] is None
+
+
 def test_refresh_skips_everything_when_nothing_is_due(refresh_env):
     db = _open(refresh_env.db_path)
     db.record_snapshot("default", datetime.now())
