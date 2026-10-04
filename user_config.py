@@ -194,8 +194,14 @@ def list_user_tags(tokens_dir="user_tokens"):
     tags = []
     for name in os.listdir(tokens_dir):
         tag, ext = os.path.splitext(name)
-        if ext == ".json" and re.match(r'^[a-zA-Z0-9_-]+$', tag):
-            tags.append(tag.lower())
+        if ext != ".json" or not re.match(r'^[a-zA-Z0-9_-]+$', tag):
+            continue
+        # Logins look up user_tokens/<lowercase tag>.json, which won't find
+        # "Alice.json" on a case-sensitive filesystem.
+        if tag != tag.lower():
+            logger.warning(f"Skipping token file '{name}': user token filenames must be lowercase.")
+            continue
+        tags.append(tag)
     return sorted(tags)
 
 

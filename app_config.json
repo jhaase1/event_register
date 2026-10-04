@@ -11,5 +11,9 @@
     "speculative_find_grace_minutes": 5,
     "speculative_recheck_hours": 6,
     "snapshot_interval_hours": 6,
-    "observed_retention_days": 42
+    "observed_retention_days": 42,
+    "cron_interval_minutes": 15,
+    "speculative_fast_poll_hours": 2,
+    "speculative_claim_stale_minutes": 60,
+    "notify_webmaster_on_unlisted_request": false
 }

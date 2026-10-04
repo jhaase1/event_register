@@ -112,9 +112,22 @@ def later_occurrence_listed(observations, event_day, slot):
     )
 
 
+def _parse_clock(text):
+    """'20:00:00' or '20:00' -> time; None if missing or malformed."""
+    for fmt in ("%H:%M:%S", "%H:%M"):
+        try:
+            return datetime.strptime(str(text).strip(), fmt).time()
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def _estimate_lead(observations, slot_obs, lead_override):
     if lead_override is not None:
-        return int(lead_override)
+        try:
+            return int(lead_override)
+        except (TypeError, ValueError):
+            logger.warning(f"Ignoring non-numeric registration_lead_days: {lead_override!r}")
 
     for pool in (slot_obs, observations):
         countdown = [o["lead_days"] for o in pool if o.get("lead_source") == "countdown" and o.get("lead_days") is not None]
@@ -182,10 +195,10 @@ def predict(
     if lead_days is None:
         return Rejection("I don't know yet how far ahead registration opens for these sessions.")
 
-    if not registration_clock:
-        return Rejection("No default registration time is configured, so I can't tell when it opens.")
+    clock = _parse_clock(registration_clock) if registration_clock else None
+    if clock is None:
+        return Rejection("No valid default registration time is configured, so I can't tell when it opens.")
 
-    clock = datetime.strptime(registration_clock, "%H:%M:%S").time()
     registration_time = datetime.combine(requested_day - timedelta(days=lead_days), clock)
     if registration_time <= now:
         return Rejection(

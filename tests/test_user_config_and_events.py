@@ -9,9 +9,21 @@ from user_config import (
     extract_user_tag,
     get_website_token_file,
     is_sender_allowed,
+    list_user_tags,
     load_user_config,
     validate_user_tag,
 )
+
+
+def test_list_user_tags_only_returns_loginable_token_files(tmp_path):
+    for name in ("default.json", "alice.json", "Bob.json", "bad name.json", "notes.txt"):
+        (tmp_path / name).write_text("{}")
+
+    assert list_user_tags(str(tmp_path)) == ["alice", "default"]
+
+
+def test_list_user_tags_missing_directory(tmp_path):
+    assert list_user_tags(str(tmp_path / "nope")) == []
 
 
 @pytest.fixture

@@ -114,12 +114,12 @@ def test_scan_listed_events_skips_cards_without_parseable_date_time():
 
 
 class _Event:
-    def __init__(self, href):
-        self._btn = FakeElement("Register", href=href)
+    def __init__(self, href, has_button=True):
+        self._btn = FakeElement("Register", href=href) if has_button else None
 
-    def find_element(self, by, selector):
+    def find_elements(self, by, selector):
         assert selector == website.REGISTER_BTN
-        return self._btn
+        return [self._btn] if self._btn else []
 
 
 def _polling_site(monkeypatch, results):
@@ -149,6 +149,36 @@ def test_find_event_url_returns_href_once_posted(monkeypatch):
     assert url == "https://x/Details/1"
     assert calls["display"] == 3
     assert calls["sleeps"] == [7, 7]
+
+
+def test_find_event_url_keeps_polling_when_card_has_no_link_or_button(monkeypatch):
+    site, calls = _polling_site(
+        monkeypatch,
+        [_Event(None), _Event("ignored", has_button=False), _Event("https://x/Details/2")],
+    )
+
+    url = site.find_event_url("Tue, Oct 13", "9a - 11a", until=datetime.now() + timedelta(minutes=5))
+
+    assert url == "https://x/Details/2"
+    assert calls["find"] == 3
+
+
+def test_find_event_miss_logs_at_debug_when_polling(monkeypatch, caplog):
+    site = website.Website.__new__(website.Website)
+    site.driver = FakeListDriver([])
+
+    class _NeverWait:
+        def __init__(self, *_a, **_k):
+            pass
+
+        def until(self, _fn):
+            raise website.TimeoutException()
+
+    monkeypatch.setattr(website, "WebDriverWait", _NeverWait)
+    caplog.set_level("DEBUG", logger="website")
+
+    assert site._find_event("Tue, Oct 13", "9a - 11a", timeout=2) is None
+    assert not [r for r in caplog.records if r.levelname == "ERROR"]
 
 
 def test_find_event_url_tries_once_even_when_deadline_passed(monkeypatch):

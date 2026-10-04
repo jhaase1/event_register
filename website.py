@@ -312,7 +312,10 @@ class Website:
         try:
             return wait.until(scan)
         except TimeoutException:
-            logger.error(f"No event found for date: {event_date}, time range: {time_range}")
+            # Short-timeout lookups are polling for a card that may not be
+            # posted yet; a miss there is expected, not an error.
+            log = logger.error if timeout is None else logger.debug
+            log(f"No event found for date: {event_date}, time range: {time_range}")
             return None
 
     @staticmethod
@@ -363,7 +366,8 @@ class Website:
             self.display_all_events()
             event = self._find_event(event_date, time_range, timeout=2)
             if event:
-                href = event.find_element(By.CSS_SELECTOR, REGISTER_BTN).get_attribute("href")
+                buttons = event.find_elements(By.CSS_SELECTOR, REGISTER_BTN)
+                href = buttons[0].get_attribute("href") if buttons else None
                 if href:
                     logger.info(f"Speculative event posted: {href}")
                     return href

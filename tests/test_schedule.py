@@ -269,6 +269,23 @@ def test_predict_rejects_when_no_registration_clock():
     assert isinstance(_predict(history, date(2026, 10, 13), registration_clock=None), schedule.Rejection)
 
 
+def test_predict_accepts_registration_clock_without_seconds():
+    history = _weekly(date(2026, 9, 29), 3, lead_days=7, lead_source="countdown")
+    result = _predict(history, date(2026, 10, 13), registration_clock="20:00")
+    assert result.registration_time == datetime(2026, 10, 6, 20, 0, 0)
+
+
+def test_predict_rejects_malformed_registration_clock_instead_of_raising():
+    history = _weekly(date(2026, 9, 29), 3, lead_days=7, lead_source="countdown")
+    assert isinstance(_predict(history, date(2026, 10, 13), registration_clock="8pm"), schedule.Rejection)
+
+
+def test_predict_ignores_non_numeric_lead_override():
+    history = _weekly(date(2026, 9, 29), 3, lead_days=7, lead_source="countdown")
+    result = _predict(history, date(2026, 10, 13), lead_override="abc")
+    assert result.lead_days == 7
+
+
 def test_predict_rejects_when_registration_should_already_be_open():
     # 7-day lead for Oct 6 means it opened Sep 29; it should be listed already.
     history = _weekly(date(2026, 9, 29), 3, lead_days=7, lead_source="countdown")

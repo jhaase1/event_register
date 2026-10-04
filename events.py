@@ -28,6 +28,11 @@ def _from_db_timestamp(value):
     return datetime.strptime(value, TIMESTAMP_FORMAT) if value else None
 
 
+# Statuses the scheduler acts on. 'in_progress' rows are claimed by a run that
+# is registering them right now; 'failed' rows had a real registration error.
+SCHEDULABLE_STATUSES = ("confirmed", "speculative")
+
+
 class Events:
     def __init__(self, db_name="events.db"):
         self.conn = sqlite3.connect(db_name)
@@ -124,7 +129,8 @@ class Events:
             """
             CREATE TABLE IF NOT EXISTS snapshots (
                 user_tag TEXT PRIMARY KEY,
-                last_snapshot TIMESTAMP NOT NULL
+                last_snapshot TIMESTAMP,
+                last_attempt TIMESTAMP
             )
         """
         )
@@ -188,9 +194,9 @@ class Events:
         self.cursor.execute(
             """
             SELECT MIN(registration_time) FROM events
-            WHERE registration_time > ?
+            WHERE registration_time > ? AND status IN (?, ?)
         """,
-            (_to_db_timestamp(timestamp),),
+            (_to_db_timestamp(timestamp), *SCHEDULABLE_STATUSES),
         )
         row = self.cursor.fetchone()
         if not row or not row[0]:
@@ -202,10 +208,10 @@ class Events:
         self.cursor.execute(
             """
             SELECT event_date, time_range, registration_time, user_tag, status, request_ref FROM events
-            WHERE registration_time = ?
+            WHERE registration_time = ? AND status IN (?, ?)
             ORDER BY user_tag ASC
         """,
-            (next_registration_time,),
+            (next_registration_time, *SCHEDULABLE_STATUSES),
         )
         rows = self.cursor.fetchall()
 
@@ -279,17 +285,17 @@ class Events:
         rows = self.cursor.fetchall()
         return rows
 
-    def get_speculative_events(self, user_tag=None):
-        """Returns speculative rows (optionally for one user) as dicts."""
+    def get_speculative_events(self, user_tag=None, status="speculative"):
+        """Returns rows with the given status (optionally for one user) as dicts."""
         query = """
             SELECT event_date, time_range, registration_time, user_tag, additional_info,
                    expected_event_day, last_checked, request_ref
-            FROM events WHERE status = 'speculative'
+            FROM events WHERE status = ?
         """
-        params = ()
+        params = (status,)
         if user_tag:
             query += " AND user_tag = ?"
-            params = (user_tag,)
+            params += (user_tag,)
         query += " ORDER BY registration_time ASC"
         self.cursor.execute(query, params)
         return [
@@ -323,6 +329,20 @@ class Events:
         )
         self.conn.commit()
         logger.info(f"Confirmed event {event_date} {time_range} for user '{user_tag}' at {registration_time}.")
+
+    def set_status(self, event_date, time_range, user_tag, status, when=None):
+        """Changes a row's status, stamping last_checked (the claim time for 'in_progress')."""
+        self.cursor.execute(
+            "UPDATE events SET status = ?, last_checked = ? WHERE event_spec = ? AND user_tag = ?",
+            (
+                status,
+                _to_db_timestamp(when or datetime.now()),
+                self.create_spec(event_date, time_range),
+                user_tag,
+            ),
+        )
+        self.conn.commit()
+        logger.info(f"Set {event_date} {time_range} for user '{user_tag}' to {status}.")
 
     def mark_checked(self, event_date, time_range, user_tag, when=None):
         self.cursor.execute(
@@ -404,14 +424,36 @@ class Events:
         self.conn.commit()
 
     def record_snapshot(self, user_tag, when):
+        """Records a successful scan of the user's listing."""
+        when = _to_db_timestamp(when)
         self.cursor.execute(
-            "INSERT OR REPLACE INTO snapshots (user_tag, last_snapshot) VALUES (?, ?)",
+            """
+            INSERT INTO snapshots (user_tag, last_snapshot, last_attempt) VALUES (?, ?, ?)
+            ON CONFLICT (user_tag) DO UPDATE SET
+                last_snapshot = excluded.last_snapshot, last_attempt = excluded.last_attempt
+            """,
+            (user_tag, when, when),
+        )
+        self.conn.commit()
+
+    def record_snapshot_attempt(self, user_tag, when):
+        """Records that a scan was attempted, so a failing login backs off."""
+        self.cursor.execute(
+            """
+            INSERT INTO snapshots (user_tag, last_attempt) VALUES (?, ?)
+            ON CONFLICT (user_tag) DO UPDATE SET last_attempt = excluded.last_attempt
+            """,
             (user_tag, _to_db_timestamp(when)),
         )
         self.conn.commit()
 
     def get_last_snapshot(self, user_tag):
         self.cursor.execute("SELECT last_snapshot FROM snapshots WHERE user_tag = ?", (user_tag,))
+        row = self.cursor.fetchone()
+        return _from_db_timestamp(row[0]) if row else None
+
+    def get_last_snapshot_attempt(self, user_tag):
+        self.cursor.execute("SELECT last_attempt FROM snapshots WHERE user_tag = ?", (user_tag,))
         row = self.cursor.fetchone()
         return _from_db_timestamp(row[0]) if row else None
 

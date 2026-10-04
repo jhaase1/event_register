@@ -1,3 +1,4 @@
+import os
 from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 
@@ -90,6 +91,7 @@ class FakeWebsite:
     cards = []
     outcome = None  # callable(event_date, time_range) -> (registration_time, info) or raises
     instances = []
+    failing_logins = set()
 
     def __init__(self, headless=True):
         self.default_registration_time = "14:00:00"
@@ -98,6 +100,8 @@ class FakeWebsite:
         FakeWebsite.instances.append(self)
 
     def login(self, user_tag=None):
+        if user_tag in FakeWebsite.failing_logins:
+            raise RuntimeError(f"login failed for {user_tag}")
         self.user_tag = user_tag
 
     def display_all_events(self):
@@ -119,8 +123,16 @@ def fake_site(monkeypatch):
     FakeWebsite.cards = []
     FakeWebsite.outcome = None
     FakeWebsite.instances = []
+    FakeWebsite.failing_logins = set()
     monkeypatch.setattr(main, "Website", FakeWebsite)
     return FakeWebsite
+
+
+@pytest.fixture(autouse=True)
+def isolated_lock(tmp_path, monkeypatch):
+    path = str(tmp_path / "refresh.lock")
+    monkeypatch.setattr(main, "REFRESH_LOCK_FILE", path)
+    return path
 
 
 def _not_found(*_args):
@@ -268,14 +280,27 @@ def refresh_env(monkeypatch, db_path, fake_site):
     client = FakeEmailClient()
     monkeypatch.setattr(main, "EmailClient", lambda: client)
     monkeypatch.setattr(main, "list_user_tags", lambda: ["default"])
-    registrations = []
+    env = SimpleNamespace(
+        client=client, registrations=[], statuses_at_register=[], register_success=True,
+        db_path=db_path, site=fake_site,
+    )
 
     def fake_register(event_info, headless=True, results=None, results_lock=None):
-        registrations.append(event_info)
-        results.append({"user_tag": event_info["user_tag"], "event": "x", "success": True})
+        env.registrations.append(event_info)
+        db = _open(db_path)
+        db.cursor.execute(
+            "SELECT status FROM events WHERE event_date = ? AND time_range = ?",
+            (event_info["event_date"], event_info["time_range"]),
+        )
+        env.statuses_at_register.append(db.cursor.fetchone()[0])
+        db.close()
+        result = {"user_tag": event_info["user_tag"], "event": "x", "success": env.register_success}
+        if not env.register_success:
+            result.update(error="signup timed out", traceback="tb")
+        results.append(result)
 
     monkeypatch.setattr(main, "register_for_single_event", fake_register)
-    return SimpleNamespace(client=client, registrations=registrations, db_path=db_path, site=fake_site)
+    return env
 
 
 def test_refresh_snapshots_stale_users(refresh_env):
@@ -563,3 +588,379 @@ def test_next_event_speculative_success_marks_confirmed(monkeypatch, db_path):
     assert db.list_all_events("default")[0][4] == "confirmed"
     db.close()
     assert client.notifications == []
+
+
+# --- review fixes: registration timing ----------------------------------------
+
+
+def test_refresh_registers_this_run_when_opening_before_next_run(refresh_env):
+    # register_for_next_event already ran; 14:00 would be missed by the next run.
+    _seed_speculative(refresh_env.db_path)
+    opens = (datetime.now() + timedelta(minutes=9)).replace(microsecond=0)
+    refresh_env.site.outcome = lambda *_a: (opens, "Intermediate Drop-in")
+
+    main.refresh_schedule_and_confirm_speculative(headless=True)
+
+    assert len(refresh_env.registrations) == 1
+    assert refresh_env.registrations[0]["registration_time"] == opens
+    db = _open(refresh_env.db_path)
+    row = db.list_all_events("default")[0]
+    db.close()
+    assert row[4] == "confirmed"
+    assert row[2] == opens.strftime("%Y-%m-%d %H:%M:%S")
+    assert any("registered" in r.body for r in refresh_env.client.replies)
+
+
+def test_refresh_inline_registration_waits_for_actual_open_time(refresh_env):
+    _seed_speculative(refresh_env.db_path)
+    opens = (datetime.now() + timedelta(seconds=40)).replace(microsecond=0)
+    refresh_env.site.outcome = lambda *_a: (opens, "info")
+
+    main.refresh_schedule_and_confirm_speculative(headless=True)
+
+    # Must dwell until the real opening, not click immediately.
+    assert refresh_env.registrations[0]["registration_time"] == opens
+
+
+def test_refresh_only_confirms_when_opening_after_next_run(refresh_env):
+    _seed_speculative(refresh_env.db_path)
+    opens = (datetime.now() + timedelta(minutes=40)).replace(microsecond=0)
+    refresh_env.site.outcome = lambda *_a: (opens, "info")
+
+    main.refresh_schedule_and_confirm_speculative(headless=True)
+
+    assert refresh_env.registrations == []
+    db = _open(refresh_env.db_path)
+    assert db.list_all_events("default")[0][4] == "confirmed"
+    db.close()
+
+
+def test_refresh_claims_row_while_registering_inline(refresh_env):
+    _seed_speculative(refresh_env.db_path, registration_time=datetime.now() - timedelta(hours=1))
+    refresh_env.site.outcome = lambda *_a: (datetime.now(), "info")
+
+    main.refresh_schedule_and_confirm_speculative(headless=True)
+
+    assert refresh_env.statuses_at_register == ["in_progress"]
+
+
+def test_refresh_inline_registration_failure_marks_failed_and_tells_everyone(refresh_env):
+    _seed_speculative(refresh_env.db_path, registration_time=datetime.now() - timedelta(hours=1))
+    refresh_env.site.outcome = lambda *_a: (datetime.now(), "info")
+    refresh_env.register_success = False
+
+    main.refresh_schedule_and_confirm_speculative(headless=True)
+
+    db = _open(refresh_env.db_path)
+    assert db.list_all_events("default")[0][4] == "failed"
+    assert db.get_speculative_events() == []
+    db.close()
+    assert any("didn't go through" in r.body for r in refresh_env.client.replies)
+    assert len(refresh_env.client.notifications) == 1
+
+
+def test_failed_row_is_not_retried_by_refresh_or_scheduler(refresh_env):
+    _seed_speculative(refresh_env.db_path, registration_time=datetime.now() + timedelta(minutes=5))
+    db = _open(refresh_env.db_path)
+    db.set_status(_date_text(REQUESTED_DAY), SLOT_TEXT, "default", "failed")
+    db.record_snapshot("default", datetime.now())
+    assert db.get_next_event_after() == []
+    db.close()
+
+    main.refresh_schedule_and_confirm_speculative(headless=True)
+
+    assert refresh_env.site.instances == []
+
+
+# --- review fixes: expiry -------------------------------------------------------
+
+
+def test_refresh_keeps_row_on_event_day_before_registration_opens(refresh_env):
+    # Lead of 0 days: posted and opened on the event day itself.
+    _seed_speculative(
+        refresh_env.db_path,
+        expected_day=TODAY,
+        registration_time=datetime.now() + timedelta(hours=3),
+    )
+    refresh_env.site.outcome = _not_found
+
+    main.refresh_schedule_and_confirm_speculative(headless=True)
+
+    db = _open(refresh_env.db_path)
+    assert len(db.get_speculative_events()) == 1
+    db.close()
+    assert refresh_env.client.replies == []
+
+
+def test_refresh_posted_without_registration_time_keeps_waiting(refresh_env):
+    _seed_speculative(refresh_env.db_path)
+    refresh_env.site.outcome = lambda *_a: (None, "info")
+
+    main.refresh_schedule_and_confirm_speculative(headless=True)
+
+    db = _open(refresh_env.db_path)
+    rows = db.get_speculative_events()
+    db.close()
+    assert rows[0]["last_checked"] is not None
+    assert refresh_env.client.replies == []
+
+
+def test_refresh_posted_without_registration_time_dropped_on_event_day(refresh_env):
+    _seed_speculative(
+        refresh_env.db_path, expected_day=TODAY, registration_time=datetime.now() - timedelta(days=1)
+    )
+    refresh_env.site.outcome = lambda *_a: (None, "info")
+
+    main.refresh_schedule_and_confirm_speculative(headless=True)
+
+    db = _open(refresh_env.db_path)
+    assert db.list_all_events("default") == []
+    db.close()
+    assert "couldn't tell when registration opens" in refresh_env.client.replies[0].body
+
+
+# --- review fixes: one event per registration time ---------------------------
+
+
+def test_confirm_replaces_other_event_at_same_registration_time(refresh_env):
+    real_time = datetime.combine(REQUESTED_DAY - timedelta(days=7), datetime.min.time()).replace(hour=20)
+    db = _open(refresh_env.db_path)
+    db.insert_event("Some other day", "1p - 3p", real_time, "default")
+    db.close()
+    _seed_speculative(refresh_env.db_path)
+    refresh_env.site.outcome = lambda *_a: (real_time, "info")
+
+    main.refresh_schedule_and_confirm_speculative(headless=True)
+
+    db = _open(refresh_env.db_path)
+    rows = db.list_all_events("default")
+    db.close()
+    assert [(r[0], r[4]) for r in rows] == [(_date_text(REQUESTED_DAY), "confirmed")]
+
+
+# --- review fixes: overlap, polling and backoff --------------------------------
+
+
+def test_refresh_skips_when_another_run_holds_the_lock(refresh_env, isolated_lock):
+    open(isolated_lock, "w").close()
+    _seed_speculative(refresh_env.db_path)
+
+    main.refresh_schedule_and_confirm_speculative(headless=True)
+
+    assert refresh_env.site.instances == []
+    assert os.path.exists(isolated_lock)  # not ours to remove
+
+
+def test_refresh_removes_stale_lock_and_runs(refresh_env, isolated_lock):
+    open(isolated_lock, "w").close()
+    old = datetime.now().timestamp() - 2 * 3600
+    os.utime(isolated_lock, (old, old))
+
+    main.refresh_schedule_and_confirm_speculative(headless=True)
+
+    assert len(refresh_env.site.instances) == 1
+    assert not os.path.exists(isolated_lock)
+
+
+def test_refresh_releases_lock_after_running(refresh_env, isolated_lock):
+    main.refresh_schedule_and_confirm_speculative(headless=True)
+    assert not os.path.exists(isolated_lock)
+
+
+def test_refresh_ignores_freshly_claimed_rows(refresh_env):
+    _seed_speculative(refresh_env.db_path, registration_time=datetime.now() - timedelta(minutes=1))
+    db = _open(refresh_env.db_path)
+    db.set_status(_date_text(REQUESTED_DAY), SLOT_TEXT, "default", "in_progress")
+    db.record_snapshot("default", datetime.now())
+    db.close()
+
+    main.refresh_schedule_and_confirm_speculative(headless=True)
+
+    assert refresh_env.site.instances == []
+    db = _open(refresh_env.db_path)
+    assert len(db.get_speculative_events(status="in_progress")) == 1
+    db.close()
+
+
+def test_refresh_releases_stale_claims(refresh_env):
+    _seed_speculative(refresh_env.db_path)
+    db = _open(refresh_env.db_path)
+    db.set_status(
+        _date_text(REQUESTED_DAY), SLOT_TEXT, "default", "in_progress",
+        when=datetime.now() - timedelta(hours=2),
+    )
+    db.close()
+    refresh_env.site.outcome = _not_found
+
+    main.refresh_schedule_and_confirm_speculative(headless=True)
+
+    db = _open(refresh_env.db_path)
+    assert len(db.get_speculative_events()) == 1
+    assert db.get_speculative_events(status="in_progress") == []
+    db.close()
+
+
+def test_refresh_stops_polling_every_run_after_fast_poll_window(refresh_env):
+    db = _open(refresh_env.db_path)
+    db.record_snapshot("default", datetime.now())
+    db.close()
+    _seed_speculative(
+        refresh_env.db_path,
+        registration_time=datetime.now() - timedelta(hours=3),
+        last_checked=datetime.now() - timedelta(minutes=15),
+    )
+
+    main.refresh_schedule_and_confirm_speculative(headless=True)
+
+    assert refresh_env.site.instances == []
+
+
+def test_failed_snapshot_login_backs_off(refresh_env):
+    refresh_env.site.failing_logins = {"default"}
+
+    main.refresh_schedule_and_confirm_speculative(headless=True)
+    main.refresh_schedule_and_confirm_speculative(headless=True)
+
+    assert len(refresh_env.site.instances) == 1
+    db = _open(refresh_env.db_path)
+    assert db.get_last_snapshot("default") is None
+    assert db.get_last_snapshot_attempt("default") is not None
+    db.close()
+
+
+def test_refresh_continues_after_a_user_fails(refresh_env, monkeypatch):
+    monkeypatch.setattr(main, "list_user_tags", lambda: ["alice", "default"])
+    refresh_env.site.failing_logins = {"alice"}
+    refresh_env.site.cards = [_card(TODAY + timedelta(days=7), opens_in=timedelta(hours=3))]
+
+    main.refresh_schedule_and_confirm_speculative(headless=True)
+
+    db = _open(refresh_env.db_path)
+    assert db.get_last_snapshot("default") is not None
+    assert db.get_last_snapshot("alice") is None
+    db.close()
+
+
+def test_refresh_continues_after_a_row_fails(refresh_env):
+    _seed_speculative(refresh_env.db_path)
+    _seed_speculative(refresh_env.db_path, expected_day=REQUESTED_DAY + timedelta(days=1))
+    calls = []
+
+    def outcome(event_date, time_range):
+        calls.append(event_date)
+        if len(calls) == 1:
+            raise RuntimeError("page blew up")
+        raise main.EventNotFound("not listed")
+
+    refresh_env.site.outcome = outcome
+
+    main.refresh_schedule_and_confirm_speculative(headless=True)
+
+    assert len(calls) == 2
+
+
+# --- review fixes: scheduler path ----------------------------------------------
+
+
+def test_next_event_claims_speculative_rows_before_registering(monkeypatch, db_path):
+    _seed_speculative(db_path, registration_time=datetime.now() + timedelta(minutes=5))
+    _wire_registration(monkeypatch, db_path, {"success": True})
+    seen = []
+    original = main.register_for_single_event
+
+    def spying(event_info, headless=True, results=None, results_lock=None):
+        db = _open(db_path)
+        seen.append(db.get_speculative_events(status="in_progress"))
+        db.close()
+        original(event_info, headless, results, results_lock)
+
+    monkeypatch.setattr(main, "register_for_single_event", spying)
+
+    main.register_for_next_event(headless=True)
+
+    assert len(seen[0]) == 1
+
+
+def test_next_event_speculative_hard_failure_marks_failed(monkeypatch, db_path):
+    _seed_speculative(db_path, registration_time=datetime.now() + timedelta(minutes=5))
+    client = _wire_registration(
+        monkeypatch, db_path, {"success": False, "error": "signup timed out", "traceback": "tb"}
+    )
+
+    main.register_for_next_event(headless=True)
+
+    db = _open(db_path)
+    assert db.list_all_events("default")[0][4] == "failed"
+    db.close()
+    assert len(client.notifications) == 1
+    assert "didn't go through" in client.replies[0].body
+
+
+def test_one_failed_followup_does_not_block_the_rest(monkeypatch, db_path):
+    when = datetime.now() + timedelta(minutes=5)
+    _seed_speculative(db_path, registration_time=when)
+    db = _open(db_path)
+    db.insert_event(
+        _date_text(REQUESTED_DAY), SLOT_TEXT, when, "alice", status="speculative",
+        expected_event_day=REQUESTED_DAY, request_ref=dict(REQUEST_REF, thread_id="thread-alice"),
+    )
+    db.close()
+    client = _wire_registration(monkeypatch, db_path, {"success": False, "speculative_not_found": True, "error": "x"})
+    original_reply = client.reply_to_email
+
+    def flaky_reply(email, body, **kwargs):
+        if email.thread_id == "thread-alice":
+            raise RuntimeError("gmail down")
+        original_reply(email, body, **kwargs)
+
+    client.reply_to_email = flaky_reply
+
+    main.register_for_next_event(headless=True)
+
+    assert [r.email.thread_id for r in client.replies] == ["thread-1"]
+    db = _open(db_path)
+    assert len(db.get_speculative_events()) == 2  # both released back to speculative
+    db.close()
+
+
+# --- review fixes: email path ----------------------------------------------------
+
+
+def test_unlisted_request_error_still_replies_and_archives(monkeypatch, db_path, fake_site):
+    fake_site.outcome = _not_found
+    client = _wire_email_flow(monkeypatch, _make_email("x"))
+
+    def boom(*_a, **_k):
+        raise ValueError("bad config")
+
+    monkeypatch.setattr(main, "_handle_unlisted_request", boom)
+
+    main.check_for_new_event(headless=True)
+
+    assert "couldn't find" in client.replies[0].body
+    assert client.archived_ids == ["msg-1"]
+
+
+@pytest.mark.parametrize("enabled, expected", [(True, 1), (False, 0)])
+def test_webmaster_notification_for_unlisted_request_is_optional(monkeypatch, db_path, fake_site, enabled, expected):
+    monkeypatch.setitem(main.APP_CONFIG, "notify_webmaster_on_unlisted_request", enabled)
+    fake_site.outcome = _not_found
+    client = _wire_email_flow(monkeypatch, _make_email("x"))
+
+    main.check_for_new_event(headless=True)
+
+    assert len(client.notifications) == expected
+    assert len(client.replies) == 1
+
+
+def test_report_shows_status_column(monkeypatch, db_path, fake_site):
+    _seed_speculative(db_path)
+    client = _wire_email_flow(monkeypatch, _make_email("report"))
+    monkeypatch.setattr(main, "extract_user_intent", lambda _e: ("report", None))
+
+    main.check_for_new_event(headless=True)
+
+    body = client.replies[0].body
+    assert "status" in body
+    assert "speculative" in body
+    assert "default" not in body

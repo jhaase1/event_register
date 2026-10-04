@@ -213,4 +213,56 @@ def test_snapshot_bookkeeping(db):
     when = datetime(2026, 10, 4, 12, 0, 0)
     db.record_snapshot("default", when)
     assert db.get_last_snapshot("default") == when
+    assert db.get_last_snapshot_attempt("default") == when
     assert db.get_last_snapshot("alice") is None
+
+
+def test_snapshot_attempt_does_not_count_as_success(db):
+    success = datetime(2026, 10, 4, 6, 0, 0)
+    attempt = datetime(2026, 10, 4, 12, 0, 0)
+    db.record_snapshot("default", success)
+    db.record_snapshot_attempt("default", attempt)
+    assert db.get_last_snapshot("default") == success
+    assert db.get_last_snapshot_attempt("default") == attempt
+
+    db.record_snapshot_attempt("alice", attempt)
+    assert db.get_last_snapshot("alice") is None
+    assert db.get_last_snapshot_attempt("alice") == attempt
+
+
+@pytest.mark.parametrize("status", ["in_progress", "failed"])
+def test_get_next_event_after_skips_claimed_and_failed_rows(db, status):
+    _insert_speculative(db)
+    db.set_status("Tue, Oct 13", "9a - 11a", "default", status)
+    assert db.get_next_event_after(datetime(2026, 10, 4)) == []
+
+
+def test_get_next_event_after_ignores_claimed_row_when_picking_next_time(db):
+    _insert_speculative(db, registration_time=datetime(2026, 10, 6, 14, 0, 0))
+    db.set_status("Tue, Oct 13", "9a - 11a", "default", "in_progress")
+    db.insert_event("Wed, Oct 14", "9a - 11a", datetime(2026, 10, 7, 14, 0, 0), "default")
+    events = db.get_next_event_after(datetime(2026, 10, 4))
+    assert [e["event_date"] for e in events] == ["Wed, Oct 14"]
+
+
+def test_set_status_stamps_claim_time_and_filters(db):
+    _insert_speculative(db)
+    when = datetime(2026, 10, 6, 13, 59, 0)
+    db.set_status("Tue, Oct 13", "9a - 11a", "default", "in_progress", when=when)
+
+    assert db.get_speculative_events() == []
+    claimed = db.get_speculative_events(status="in_progress")
+    assert len(claimed) == 1
+    assert claimed[0]["last_checked"] == when
+
+
+def test_opening_migrated_db_twice_is_idempotent(tmp_path):
+    path = str(tmp_path / "events.db")
+    Events(db_name=path).close()
+    first = Events(db_name=path)
+    first.insert_event("Tue, Oct 13", "9a - 11a", datetime(2026, 10, 6, 14), "default")
+    first.close()
+
+    second = Events(db_name=path)
+    assert len(second.list_all_events("default")) == 1
+    second.close()
