@@ -2,18 +2,26 @@ import textile
 from tabulate import tabulate
 import json
 from events import Events
-from website import Website, SkillLevelIneligible
+from website import Website, SkillLevelIneligible, EventNotFound
 from dwell import dwell_until, is_within_offset
 from email_client import EmailClient
 from user_intent import extract_user_intent
-from user_config import extract_user_tag, validate_user_tag, is_sender_allowed
+from user_config import (
+    extract_user_tag,
+    validate_user_tag,
+    is_sender_allowed,
+    load_user_config,
+    list_user_tags,
+)
+import schedule
 from logging_config import get_logger
 import os
 import random
 import threading
 import concurrent.futures
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 import platform
 import sys
 
@@ -24,6 +32,14 @@ DEFAULT_APP_CONFIG = {
     "min_delay_seconds": 4,
     "max_delay_seconds": 6,
     "cleanup_days": 8,
+    "speculative_enabled": True,
+    "speculative_lookback_weeks": 4,
+    "speculative_min_matches": 3,
+    "speculative_max_weeks_ahead": 3,
+    "speculative_find_grace_minutes": 5,
+    "speculative_recheck_hours": 6,
+    "snapshot_interval_hours": 6,
+    "observed_retention_days": 42,
 }
 
 if os.name == "nt":
@@ -68,8 +84,15 @@ def register_for_single_event(
     time_range = event_info["time_range"]
     registration_time = event_info["registration_time"]
     user_tag = event_info["user_tag"]
+    status = event_info.get("status", "confirmed")
 
     def _record_result(result):
+        result.update(
+            event_date=event_date,
+            time_range=time_range,
+            status=status,
+            request_ref=event_info.get("request_ref"),
+        )
         if results is not None:
             if results_lock:
                 with results_lock:
@@ -85,7 +108,30 @@ def register_for_single_event(
     try:
         website = Website(headless=headless)
         website.login(user_tag=user_tag)
-        event_url = website.get_event_url(event_date, time_range)
+        if status == "speculative":
+            # The session may only get posted the moment registration opens,
+            # so keep looking for it a little past the predicted time.
+            deadline = registration_time + timedelta(
+                minutes=APP_CONFIG["speculative_find_grace_minutes"]
+            )
+            event_url = website.find_event_url(event_date, time_range, until=deadline)
+            if not event_url:
+                logger.info(
+                    f"Speculative event for user '{user_tag}' not posted by {deadline}: {event_date} {time_range}"
+                )
+                _record_result(
+                    {
+                        "user_tag": user_tag,
+                        "event": f"{event_date} {time_range}",
+                        "success": False,
+                        "speculative_not_found": True,
+                        "error": "event not posted at the predicted time",
+                        "registration_time": registration_time,
+                    }
+                )
+                return
+        else:
+            event_url = website.get_event_url(event_date, time_range)
 
         delay = random.uniform(MIN_DELAY, MAX_DELAY)
         logger.info(
@@ -192,36 +238,165 @@ def register_for_next_event(headless=True):
 
     # Report results and notify on failures
     succeeded = [r for r in results if r["success"]]
-    failed = [r for r in results if not r["success"]]
+    # A speculative session that hasn't been posted yet isn't a system failure;
+    # the row stays speculative and the confirmation step keeps polling for it.
+    not_posted = [r for r in results if r.get("speculative_not_found")]
+    failed = [r for r in results if not r["success"] and not r.get("speculative_not_found")]
     if results:
         logger.info(
-            f"Registration complete: {len(succeeded)} succeeded, {len(failed)} failed."
+            f"Registration complete: {len(succeeded)} succeeded, {len(failed)} failed, "
+            f"{len(not_posted)} speculative not posted yet."
         )
-    if failed:
+
+    for r in succeeded:
+        if r.get("status") == "speculative":
+            events.confirm_event(
+                r["event_date"], r["time_range"], r["user_tag"], registration_time
+            )
+
+    if not_posted:
         try:
             notifier = EmailClient()
-            for f in failed:
-                logger.error(
-                    f"FAILED: user '{f['user_tag']}' for {f['event']}: {f['error']}"
-                )
-                ctx = {
-                    "user_tag": f.get("user_tag"),
-                    "event": f.get("event"),
-                    "registration_time": f.get("registration_time"),
-                    "error": f.get("error"),
-                    "traceback": f.get("traceback"),
-                }
-                notifier.send_notification(
-                    subject="Event registration failed",
-                    body=_format_failure_body(ctx, headless_flag=headless),
-                    user_tag=f["user_tag"],
+            for r in not_posted:
+                _reply_to_request(
+                    notifier,
+                    r.get("request_ref"),
+                    f"The {r['event']} session wasn't posted when I expected registration to open "
+                    f"({registration_time}). I'll keep checking every run and register as soon as it shows up.",
+                    r["user_tag"],
                 )
         except Exception as e:
-            logger.error(f"Failed to send failure notifications: {e}", exc_info=True)
+            logger.error(f"Failed to send not-posted replies: {e}", exc_info=True)
+
+    _notify_registration_failures(failed, headless)
 
     logger.info("Removing old events from the database.")
     events.remove_old_events(n_days=cleanup_days)
     events.close()
+
+
+def _notify_registration_failures(failed, headless):
+    if not failed:
+        return
+    try:
+        notifier = EmailClient()
+        for f in failed:
+            logger.error(
+                f"FAILED: user '{f['user_tag']}' for {f['event']}: {f['error']}"
+            )
+            ctx = {
+                "user_tag": f.get("user_tag"),
+                "event": f.get("event"),
+                "registration_time": f.get("registration_time"),
+                "error": f.get("error"),
+                "traceback": f.get("traceback"),
+            }
+            notifier.send_notification(
+                subject="Event registration failed",
+                body=_format_failure_body(ctx, headless_flag=headless),
+                user_tag=f["user_tag"],
+            )
+    except Exception as e:
+        logger.error(f"Failed to send failure notifications: {e}", exc_info=True)
+
+
+def _reply_to_request(email_client, request_ref, body, user_tag, subject=None):
+    """Follows up in the thread of the email that asked for a speculative registration."""
+    if not request_ref:
+        email_client.send_notification(
+            subject=subject or "Speculative registration update", body=body, user_tag=user_tag
+        )
+        return
+    original = SimpleNamespace(
+        id=request_ref.get("message_id"),
+        From=request_ref.get("from") or [],
+        subject=request_ref.get("subject") or "",
+        message_id=request_ref.get("message_id"),
+        thread_id=request_ref.get("thread_id"),
+    )
+    email_client.reply_to_email(original, body, subject=subject, user_tag=user_tag)
+
+
+def _record_listing(events, website, user_tag, now):
+    """Saves every card on the already-loaded events list as schedule history."""
+    try:
+        cards = website.scan_listed_events()
+        observations = [o for o in (schedule.to_observation(c, now) for c in cards) if o]
+        events.upsert_observations(user_tag, observations, seen_at=now)
+        events.record_snapshot(user_tag, now)
+    except Exception:
+        logger.exception(f"Failed to record event listing for user '{user_tag}'")
+
+
+def _handle_unlisted_request(events, website, email, user_tag, event_date, time_range):
+    """Tries to accept a request for an event that isn't on the website yet.
+
+    Returns the reply text for the user.
+    """
+    now = datetime.now()
+    not_found = f"I couldn't find {event_date} {time_range} on the website."
+
+    # determine_access_date left the full list loaded, so this scan is free.
+    _record_listing(events, website, user_tag, now)
+
+    if not APP_CONFIG["speculative_enabled"]:
+        return not_found
+
+    parsed = schedule.parse_request(event_date, time_range, now.date())
+    if not parsed:
+        return not_found
+    requested_day, slot = parsed
+
+    observations = events.get_observations(
+        user_tag, since=now.date() - timedelta(weeks=APP_CONFIG["speculative_lookback_weeks"])
+    )
+    user_config = load_user_config(user_tag) or {}
+    result = schedule.predict(
+        observations,
+        requested_day,
+        slot,
+        now,
+        lookback_weeks=APP_CONFIG["speculative_lookback_weeks"],
+        min_matches=APP_CONFIG["speculative_min_matches"],
+        max_weeks_ahead=APP_CONFIG["speculative_max_weeks_ahead"],
+        registration_clock=website.default_registration_time,
+        lead_override=user_config.get("registration_lead_days"),
+    )
+    if isinstance(result, schedule.Rejection):
+        logger.info(f"Speculative request rejected for user '{user_tag}': {result.reason}")
+        return f"{not_found} It isn't posted yet and I can't schedule it ahead of time: {result.reason}"
+
+    old_events = events.get_events_by_date(result.registration_time, user_tag=user_tag)
+    for old_event in old_events:
+        logger.info(f"Replacing event at the same registration time: {old_event}")
+        events.remove_event(*old_event, user_tag=user_tag)
+
+    matched = ", ".join(f"{d:%b} {d.day}" for d in result.matched_days)
+    events.insert_event(
+        event_date=event_date,
+        time_range=time_range,
+        registration_time=result.registration_time,
+        user_tag=user_tag,
+        additional_info=f"Not posted yet; same slot seen {matched}",
+        status="speculative",
+        expected_event_day=requested_day,
+        request_ref={
+            "from": email.From,
+            "thread_id": email.thread_id,
+            "message_id": email.message_id,
+            "subject": email.subject,
+        },
+    )
+
+    reply = (
+        f"That session isn't posted on the website yet, but the same {requested_day:%A} "
+        f"{time_range} slot was listed on {matched}. I expect registration to open at "
+        f"{result.registration_time} and will try to register then. If it opens at a "
+        f"different time I'll register as soon as it shows up, and I'll email you once it's posted."
+    )
+    if result.names:
+        reply += f"\n\nRecent sessions in that slot: {', '.join(result.names)}"
+    return reply
 
 
 def check_for_new_event(headless=True):
@@ -312,6 +487,22 @@ def check_for_new_event(headless=True):
                     f"Event not eligible for user '{user_tag}' due to skill level: {e}"
                 )
                 email_client.reply_to_email(email, str(e), user_tag=user_tag)
+                email_client.mark_email_as_read(email)
+                email_client.archive_email(email)
+                continue
+            except EventNotFound:
+                logger.info(
+                    f"Event not listed for user '{user_tag}': {event_date} {time_range}; trying speculative."
+                )
+                reply = _handle_unlisted_request(
+                    events, website, email, user_tag, event_date, time_range
+                )
+                email_client.reply_to_email(
+                    email,
+                    reply,
+                    subject=f"Event Registration: {event_date} {time_range}",
+                    user_tag=user_tag,
+                )
                 email_client.mark_email_as_read(email)
                 email_client.archive_email(email)
                 continue
@@ -430,7 +621,7 @@ def check_for_new_event(headless=True):
         # Omit user_tag column (last element) from each row for privacy
         event_list = [row[:-1] for row in event_list]
 
-        headers = ["event date", "time range", "registration time", "additional info"]
+        headers = ["event date", "time range", "registration time", "additional info", "status"]
         reply = tabulate(event_list, headers=headers)
         reply_html = tabulate(event_list, headers=headers, tablefmt="html")
 
@@ -451,6 +642,154 @@ def check_for_new_event(headless=True):
         except Exception as e:
             logger.error(f"Error closing website for user '{tag}': {e}")
     events.close()
+
+def _check_speculative_row(events, website, email_client, row, now, headless):
+    """Looks for one speculative event on the site and acts on what it finds."""
+    event_date, time_range, user_tag = row["event_date"], row["time_range"], row["user_tag"]
+    request_ref = row["request_ref"]
+    label = f"{event_date} {time_range}"
+
+    try:
+        registration_time, additional_info = website.determine_access_date(event_date, time_range)
+    except SkillLevelIneligible as e:
+        logger.info(f"Speculative event {label} for '{user_tag}' is skill-ineligible: {e}")
+        events.remove_event(event_date, time_range, user_tag=user_tag)
+        _reply_to_request(email_client, request_ref, str(e), user_tag)
+        return
+    except EventNotFound:
+        expected_day = row["expected_event_day"]
+        parsed = schedule.parse_request(event_date, time_range, now.date())
+        skipped = bool(
+            expected_day
+            and parsed
+            and schedule.later_occurrence_listed(
+                events.get_observations(user_tag, since=expected_day), expected_day, parsed[1]
+            )
+        )
+        if skipped or (expected_day and expected_day <= now.date()):
+            logger.info(f"Speculative event {label} for '{user_tag}' never posted; dropping it.")
+            events.remove_event(event_date, time_range, user_tag=user_tag)
+            _reply_to_request(
+                email_client,
+                request_ref,
+                f"The {label} session never posted on the website (it looks cancelled or "
+                f"skipped this week), so I won't register for it.",
+                user_tag,
+            )
+        else:
+            logger.info(f"Speculative event {label} for '{user_tag}' not posted yet.")
+            events.mark_checked(event_date, time_range, user_tag, when=now)
+        return
+
+    if registration_time is None:
+        logger.warning(
+            f"Speculative event {label} for '{user_tag}' is posted but its registration time "
+            "couldn't be read; keeping the prediction."
+        )
+        events.mark_checked(event_date, time_range, user_tag, when=now)
+        return
+
+    if registration_time <= datetime.now() + timedelta(minutes=1):
+        # Already open (the prediction was off): register right away rather
+        # than waiting for the next cron run.
+        open_now = datetime.now()
+        events.confirm_event(event_date, time_range, user_tag, open_now, additional_info)
+        results = []
+        register_for_single_event(
+            {
+                "event_date": event_date,
+                "time_range": time_range,
+                "registration_time": open_now,
+                "user_tag": user_tag,
+                "status": "confirmed",
+            },
+            headless=headless,
+            results=results,
+        )
+        if any(r["success"] for r in results):
+            _reply_to_request(
+                email_client,
+                request_ref,
+                f"The {label} session is posted and I registered you for it.",
+                user_tag,
+            )
+        _notify_registration_failures([r for r in results if not r["success"]], headless)
+        return
+
+    events.confirm_event(event_date, time_range, user_tag, registration_time, additional_info)
+    reply = (
+        f"The {label} session is now posted. Registration opens at {registration_time} "
+        "and I'll register then."
+    )
+    if additional_info:
+        reply += f"\n\nAdditional info: {additional_info}"
+    _reply_to_request(email_client, request_ref, reply, user_tag)
+
+
+def refresh_schedule_and_confirm_speculative(headless=True):
+    """Records schedule history and follows up on speculative registrations.
+
+    Each user's listing is snapshotted every snapshot_interval_hours so the
+    weekly pattern builds up even when no one is emailing. Speculative rows
+    are rechecked every speculative_recheck_hours, and on every run once their
+    predicted registration time has passed.
+    """
+    logger.info("Refreshing schedule history and checking speculative registrations.")
+    now = datetime.now()
+    events = Events()
+    snapshot_interval = timedelta(hours=APP_CONFIG["snapshot_interval_hours"])
+    recheck_interval = timedelta(hours=APP_CONFIG["speculative_recheck_hours"])
+
+    due_rows = {}
+    for row in events.get_speculative_events():
+        if (
+            row["last_checked"] is None
+            or now >= row["registration_time"]
+            or now - row["last_checked"] >= recheck_interval
+        ):
+            due_rows.setdefault(row["user_tag"], []).append(row)
+
+    stale_users = set()
+    for tag in list_user_tags():
+        last = events.get_last_snapshot(tag)
+        if last is None or now - last >= snapshot_interval:
+            stale_users.add(tag)
+
+    user_tags = sorted(stale_users | set(due_rows))
+    if not user_tags:
+        logger.info("No snapshots or speculative checks due.")
+        events.close()
+        return
+
+    email_client = EmailClient() if due_rows else None
+
+    for tag in user_tags:
+        website = None
+        try:
+            website = Website(headless=headless)
+            website.login(user_tag=tag)
+            website.display_all_events()
+            _record_listing(events, website, tag, now)
+
+            for row in due_rows.get(tag, []):
+                try:
+                    _check_speculative_row(events, website, email_client, row, now, headless)
+                except Exception:
+                    logger.exception(
+                        f"Failed to check speculative event {row['event_date']} {row['time_range']} for '{tag}'"
+                    )
+        except Exception:
+            logger.exception(f"Failed to refresh schedule for user '{tag}'")
+        finally:
+            if website is not None:
+                try:
+                    website.close()
+                except Exception as close_error:
+                    logger.warning(f"Failed to close website for user '{tag}': {close_error}")
+
+    events.remove_old_observations(n_days=APP_CONFIG["observed_retention_days"])
+    events.close()
+
 
 def _format_failure_body(context: dict, headless_flag: bool = True) -> str:
     """Build a generalized failure body from a context dictionary.
@@ -486,3 +825,9 @@ if __name__ == "__main__":
         logger.error(f"An error occurred: {e}")
 
     register_for_next_event(headless=headless)
+
+    # Runs after registration so a slow scan never delays an imminent hold.
+    try:
+        refresh_schedule_and_confirm_speculative(headless=headless)
+    except Exception as e:
+        logger.error(f"Speculative refresh failed: {e}", exc_info=True)

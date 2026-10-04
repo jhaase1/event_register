@@ -103,6 +103,7 @@ If neither `email` nor `authorized_senders` is configured, all requests for that
 - **Application Settings**:
     - Runtime timing and cleanup settings live in `app_config.json` at the repo root.
     - Current keys: `hold_buffer_minutes`, `login_buffer_minutes`, `min_delay_seconds`, `max_delay_seconds`, `cleanup_days`.
+    - Speculative pre-registration keys (see below): `speculative_enabled`, `speculative_lookback_weeks`, `speculative_min_matches`, `speculative_max_weeks_ahead`, `speculative_find_grace_minutes`, `speculative_recheck_hours`, `snapshot_interval_hours`, `observed_retention_days`.
 
 - **Website Credentials**:
     - Store per-user website login credentials in `user_tokens/<tag>.json`:
@@ -123,6 +124,17 @@ Send an email to the system's Gmail address (with optional plus-tag for user rou
 - **Add event**: Include the event date and time range in the email body.
 - **Remove event**: Include "stop", "cancel", or "remove" in the body along with the event details.
 - **Report**: Use "report" in the subject to receive a list of scheduled events.
+
+### Speculative Pre-Registration
+
+If you ask for a session that isn't on the website yet, the system checks whether the same weekday and time slot has been listed in recent weeks (at least `speculative_min_matches` times in the last `speculative_lookback_weeks` weeks). If so, it accepts the request as **speculative**:
+
+- It predicts when registration opens from how far ahead past sessions opened. Set `"registration_lead_days"` in a user's token file to override the learned value.
+- At the predicted time it keeps reloading the list for up to `speculative_find_grace_minutes` in case the session is posted the moment registration opens.
+- On every run it also checks whether the session has been posted. It confirms the registration time by replying in your original email thread, or registers right away if the session is already open.
+- If a later week of the same slot is posted first, or the session date arrives, it assumes the session was cancelled, drops the request, and tells you.
+
+The schedule history is built by scanning each user's events list every `snapshot_interval_hours`. There is no backfill, so for the first few weeks matches come mostly from sessions currently listed.
 
 ## Example
 
