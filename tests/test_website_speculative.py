@@ -230,3 +230,49 @@ def test_register_for_event_without_url_raises_event_not_found():
 
     with pytest.raises(website.EventNotFound):
         site.register_for_event("Tue, Oct 13", "9a - 11a", event_url=None)
+
+
+# --- registration clock parsing ----------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [("20:00:00", (20, 0, 0)), ("20:00", (20, 0, 0)), (" 08:30 ", (8, 30, 0)), ("8pm", None), (None, None)],
+)
+def test_parse_clock(text, expected):
+    parsed = website.parse_clock(text)
+    assert (parsed.hour, parsed.minute, parsed.second) == expected if expected else parsed is None
+
+
+class _CountdownCard:
+    def __init__(self, dropin):
+        self._btn = FakeElement("Details", href=None)
+        self._dropin = FakeElement(dropin)
+
+    def find_element(self, by, selector):
+        if selector == website.REGISTER_BTN:
+            return self._btn
+        raise NoSuchElementException(selector)
+
+    def find_elements(self, by, selector):
+        return [self._dropin] if selector == website.DROPIN_MSG else []
+
+
+def _countdown_site(registration_clock):
+    site = website.Website.__new__(website.Website)
+    site.default_registration_time = registration_clock
+    site.skill_level = None
+    site.display_all_events = lambda: None
+    site._find_event = lambda *_a, **_k: _CountdownCard("Registration opens in 2 days and 5 h")
+    site._card_summary = lambda _e: "summary"
+    return site
+
+
+def test_determine_access_date_accepts_clock_without_seconds():
+    when, _summary = _countdown_site("20:00").determine_access_date("Tue, Oct 13", "9a - 11a")
+    assert (when.hour, when.minute, when.second) == (20, 0, 0)
+
+
+def test_determine_access_date_ignores_malformed_clock_instead_of_raising():
+    when, _summary = _countdown_site("8pm").determine_access_date("Tue, Oct 13", "9a - 11a")
+    assert when is not None

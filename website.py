@@ -95,6 +95,16 @@ def _parse_time_range(text):
     return h1, int(match.group("m1") or 0), h2, int(match.group("m2") or 0)
 
 
+def parse_clock(text):
+    """'20:00:00' or '20:00' -> time; None if malformed."""
+    for fmt in ("%H:%M:%S", "%H:%M"):
+        try:
+            return datetime.strptime(str(text).strip(), fmt).time()
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def _parse_opens_in(text):
     """Parses 'Registration opens in 1 day and 23 h' / '23 h and 49 min' / '45 sec' into a timedelta."""
     matches = OPENS_IN_UNIT_RE.findall(text)
@@ -458,8 +468,13 @@ class Website:
         date = datetime.now() + opens_in
         logger.debug(f"Registration opens in {opens_in}, landing on {date}.")
 
-        if registration_time:
-            reg_time = datetime.strptime(registration_time, "%H:%M:%S").time()
+        reg_time = parse_clock(registration_time) if registration_time else None
+        if registration_time and reg_time is None:
+            logger.warning(
+                f"Ignoring malformed default_registration_time {registration_time!r}; "
+                "using the countdown time as is."
+            )
+        if reg_time:
             date = date.replace(
                 hour=reg_time.hour,
                 minute=reg_time.minute,

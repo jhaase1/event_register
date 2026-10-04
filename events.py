@@ -35,7 +35,9 @@ SCHEDULABLE_STATUSES = ("confirmed", "speculative")
 
 class Events:
     def __init__(self, db_name="events.db"):
-        self.conn = sqlite3.connect(db_name)
+        # Overlapping cron runs share this file; wait for a lock instead of
+        # failing fast with "database is locked".
+        self.conn = sqlite3.connect(db_name, timeout=30)
         self.cursor = self.conn.cursor()
         self._create_table()
 
@@ -125,6 +127,17 @@ class Events:
             )
         """
         )
+        self.cursor.execute("PRAGMA table_info(snapshots)")
+        snapshot_columns = {column[1] for column in self.cursor.fetchall()}
+        if snapshot_columns and "last_attempt" not in snapshot_columns:
+            # Early builds made last_snapshot NOT NULL with no last_attempt;
+            # adding the column isn't enough (attempt-only rows would violate
+            # NOT NULL), and the table only holds scan times, so rebuild it.
+            # Those builds also trusted first sightings on the very first scan,
+            # so their first_seen leads may be bogus.
+            logger.info("Rebuilding legacy snapshots table and dropping untrusted first_seen leads.")
+            self.cursor.execute("DROP TABLE snapshots")
+            self.cursor.execute("DELETE FROM observed_events WHERE lead_source = 'first_seen'")
         self.cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS snapshots (
@@ -246,15 +259,29 @@ class Events:
         )
         self.conn.commit()
 
+    def remove_event_if_status(self, event_date, time_range, user_tag, status):
+        """Deletes the row only if it still has `status`. Returns whether it did."""
+        self.cursor.execute(
+            "DELETE FROM events WHERE event_spec = ? AND user_tag = ? AND status = ?",
+            (self.create_spec(event_date, time_range), user_tag, status),
+        )
+        self.conn.commit()
+        return self.cursor.rowcount > 0
+
     def remove_old_events(self, n_days):
-        """Removes events with a registration_time older than n_days days ago."""
+        """Removes events with a registration_time older than n_days days ago.
+
+        Speculative rows whose event day hasn't passed are kept: the refresh
+        step still polls them and tells the requester when they expire.
+        """
         cutoff = datetime.now() - timedelta(days=n_days)
         cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
         self.cursor.execute(
             """
             DELETE FROM events WHERE registration_time < ?
+            AND NOT (status = 'speculative' AND expected_event_day >= ?)
             """,
-            (cutoff_str,),
+            (cutoff_str, datetime.now().date().isoformat()),
         )
         self.conn.commit()
 
@@ -312,37 +339,105 @@ class Events:
             for row in self.cursor.fetchall()
         ]
 
-    def confirm_event(self, event_date, time_range, user_tag, registration_time, additional_info=None):
-        """Promotes a speculative row once the real event card has been seen."""
+    def get_status(self, event_date, time_range, user_tag):
+        """Returns the row's current status, or None if it no longer exists."""
+        self.cursor.execute(
+            "SELECT status FROM events WHERE event_spec = ? AND user_tag = ?",
+            (self.create_spec(event_date, time_range), user_tag),
+        )
+        row = self.cursor.fetchone()
+        return row[0] if row else None
+
+    def get_rows_at(self, registration_time, user_tag):
+        """Returns this user's rows at a registration time, with status and request_ref."""
         self.cursor.execute(
             """
+            SELECT event_date, time_range, status, request_ref FROM events
+            WHERE registration_time = ? AND user_tag = ?
+            """,
+            (_to_db_timestamp(registration_time), user_tag),
+        )
+        return [
+            {
+                "event_date": row[0],
+                "time_range": row[1],
+                "status": row[2],
+                "request_ref": json.loads(row[3]) if row[3] else None,
+            }
+            for row in self.cursor.fetchall()
+        ]
+
+    def confirm_event(
+        self, event_date, time_range, user_tag, registration_time, additional_info=None, expected=None
+    ):
+        """Promotes a speculative row once the real event card has been seen.
+
+        With `expected`, only updates a row still in that status. Returns
+        whether a row was updated.
+        """
+        query = """
             UPDATE events SET status = 'confirmed', registration_time = ?,
                 additional_info = COALESCE(?, additional_info)
             WHERE event_spec = ? AND user_tag = ?
-            """,
-            (
-                _to_db_timestamp(registration_time),
-                additional_info,
-                self.create_spec(event_date, time_range),
-                user_tag,
-            ),
+        """
+        params = (
+            _to_db_timestamp(registration_time),
+            additional_info,
+            self.create_spec(event_date, time_range),
+            user_tag,
         )
+        if expected is not None:
+            query += " AND status = ?"
+            params += (expected,)
+        self.cursor.execute(query, params)
         self.conn.commit()
-        logger.info(f"Confirmed event {event_date} {time_range} for user '{user_tag}' at {registration_time}.")
+        updated = self.cursor.rowcount > 0
+        if updated:
+            logger.info(f"Confirmed event {event_date} {time_range} for user '{user_tag}' at {registration_time}.")
+        return updated
 
-    def set_status(self, event_date, time_range, user_tag, status, when=None):
-        """Changes a row's status, stamping last_checked (the claim time for 'in_progress')."""
+    def set_status(self, event_date, time_range, user_tag, status, when=None, expected=None):
+        """Changes a row's status, stamping last_checked (the claim time for 'in_progress').
+
+        With `expected`, the change only applies if the row is still in that
+        status, which makes it a compare-and-swap across processes. Returns
+        whether a row was updated.
+        """
+        query = "UPDATE events SET status = ?, last_checked = ? WHERE event_spec = ? AND user_tag = ?"
+        params = (
+            status,
+            _to_db_timestamp(when or datetime.now()),
+            self.create_spec(event_date, time_range),
+            user_tag,
+        )
+        if expected is not None:
+            query += " AND status = ?"
+            params += (expected,)
+        self.cursor.execute(query, params)
+        self.conn.commit()
+        updated = self.cursor.rowcount > 0
+        if updated:
+            logger.info(f"Set {event_date} {time_range} for user '{user_tag}' to {status}.")
+        return updated
+
+    def claim(self, event_date, time_range, user_tag, when=None):
+        """Atomically takes a speculative row for registration. False if another
+        run already claimed, resolved or removed it."""
+        return self.set_status(
+            event_date, time_range, user_tag, "in_progress", when=when, expected="speculative"
+        )
+
+    def release_claim(self, event_date, time_range, user_tag):
+        """Returns a claimed row to speculative and makes it due for an immediate recheck."""
         self.cursor.execute(
-            "UPDATE events SET status = ?, last_checked = ? WHERE event_spec = ? AND user_tag = ?",
-            (
-                status,
-                _to_db_timestamp(when or datetime.now()),
-                self.create_spec(event_date, time_range),
-                user_tag,
-            ),
+            """
+            UPDATE events SET status = 'speculative', last_checked = NULL
+            WHERE event_spec = ? AND user_tag = ? AND status = 'in_progress'
+            """,
+            (self.create_spec(event_date, time_range), user_tag),
         )
         self.conn.commit()
-        logger.info(f"Set {event_date} {time_range} for user '{user_tag}' to {status}.")
+        return self.cursor.rowcount > 0
 
     def mark_checked(self, event_date, time_range, user_tag, when=None):
         self.cursor.execute(

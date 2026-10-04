@@ -266,3 +266,108 @@ def test_opening_migrated_db_twice_is_idempotent(tmp_path):
     second = Events(db_name=path)
     assert len(second.list_all_events("default")) == 1
     second.close()
+
+
+# --- round-2 review fixes -----------------------------------------------------
+
+
+def test_legacy_snapshots_table_is_rebuilt_and_untrusted_leads_dropped(tmp_path):
+    path = str(tmp_path / "events.db")
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE snapshots (user_tag TEXT PRIMARY KEY, last_snapshot TIMESTAMP NOT NULL)")
+    conn.execute("INSERT INTO snapshots VALUES ('default', '2026-10-04 12:00:00')")
+    conn.commit()
+    conn.close()
+    # observed_events from the same early build, with a bogus first_seen lead.
+    early = Events(db_name=path)
+    early.close()
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "INSERT INTO observed_events VALUES ('default', '2026-10-05', '09:00', '11:00', 'A', 'c', 1, 'first_seen', "
+        "'2026-10-04 12:00:00', '2026-10-04 12:00:00')"
+    )
+    conn.execute(
+        "INSERT INTO observed_events VALUES ('default', '2026-10-13', '09:00', '11:00', 'B', 'c', 7, 'countdown', "
+        "'2026-10-04 12:00:00', '2026-10-04 12:00:00')"
+    )
+    conn.execute("DROP TABLE snapshots")
+    conn.execute("CREATE TABLE snapshots (user_tag TEXT PRIMARY KEY, last_snapshot TIMESTAMP NOT NULL)")
+    conn.commit()
+    conn.close()
+
+    db = Events(db_name=path)
+    db.record_snapshot_attempt("default", datetime(2026, 10, 4, 13))
+    db.record_snapshot_attempt("alice", datetime(2026, 10, 4, 13))
+    assert db.get_last_snapshot_attempt("alice") == datetime(2026, 10, 4, 13)
+    assert [o["lead_source"] for o in db.get_observations("default", since=date(2026, 1, 1))] == ["countdown"]
+    db.close()
+
+
+def test_claim_succeeds_only_once(db):
+    _insert_speculative(db)
+    assert db.claim("Tue, Oct 13", "9a - 11a", "default") is True
+    assert db.claim("Tue, Oct 13", "9a - 11a", "default") is False
+    assert db.claim("No such", "event", "default") is False
+
+
+@pytest.mark.parametrize("status", ["confirmed", "failed", "in_progress"])
+def test_claim_refuses_non_speculative_rows(db, status):
+    _insert_speculative(db)
+    db.set_status("Tue, Oct 13", "9a - 11a", "default", status)
+    assert db.claim("Tue, Oct 13", "9a - 11a", "default") is False
+    assert db.get_status("Tue, Oct 13", "9a - 11a", "default") == status
+
+
+def test_conditional_updates_leave_rows_another_run_changed(db):
+    _insert_speculative(db)
+    db.set_status("Tue, Oct 13", "9a - 11a", "default", "failed")
+
+    assert db.confirm_event(
+        "Tue, Oct 13", "9a - 11a", "default", datetime(2026, 10, 6, 20), expected="in_progress"
+    ) is False
+    assert db.set_status("Tue, Oct 13", "9a - 11a", "default", "speculative", expected="in_progress") is False
+    assert db.get_status("Tue, Oct 13", "9a - 11a", "default") == "failed"
+
+
+def test_release_claim_makes_row_due_immediately(db):
+    _insert_speculative(db)
+    db.claim("Tue, Oct 13", "9a - 11a", "default")
+    assert db.release_claim("Tue, Oct 13", "9a - 11a", "default") is True
+    row = db.get_speculative_events()[0]
+    assert row["last_checked"] is None
+    # Only claimed rows are released.
+    assert db.release_claim("Tue, Oct 13", "9a - 11a", "default") is False
+
+
+def test_remove_event_if_status(db):
+    _insert_speculative(db)
+    assert db.remove_event_if_status("Tue, Oct 13", "9a - 11a", "default", "confirmed") is False
+    assert db.remove_event_if_status("Tue, Oct 13", "9a - 11a", "default", "speculative") is True
+    assert db.get_status("Tue, Oct 13", "9a - 11a", "default") is None
+
+
+def test_remove_old_events_keeps_speculative_rows_still_waiting(db):
+    long_ago = datetime.now() - timedelta(days=10)
+    db.insert_event(
+        "Future day", "9a - 11a", long_ago, "default", status="speculative",
+        expected_event_day=datetime.now().date() + timedelta(days=2),
+    )
+    db.insert_event(
+        "Past day", "9a - 11a", long_ago, "default", status="speculative",
+        expected_event_day=datetime.now().date() - timedelta(days=1),
+    )
+    db.insert_event("Old failed", "9a - 11a", long_ago, "default", status="failed")
+    db.insert_event("Old confirmed", "9a - 11a", long_ago, "default")
+
+    db.remove_old_events(n_days=8)
+
+    assert [r[0] for r in db.list_all_events("default")] == ["Future day"]
+
+
+def test_get_rows_at_returns_status_and_request_ref(db):
+    _insert_speculative(db)
+    rows = db.get_rows_at(datetime(2026, 10, 6, 14, 0, 0), "default")
+    assert rows == [
+        {"event_date": "Tue, Oct 13", "time_range": "9a - 11a", "status": "speculative", "request_ref": REQUEST_REF}
+    ]
+    assert db.get_rows_at(datetime(2026, 10, 6, 14, 0, 0), "alice") == []

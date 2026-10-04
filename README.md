@@ -104,7 +104,7 @@ If neither `email` nor `authorized_senders` is configured, all requests for that
     - Runtime timing and cleanup settings live in `app_config.json` at the repo root.
     - Current keys: `hold_buffer_minutes`, `login_buffer_minutes`, `min_delay_seconds`, `max_delay_seconds`, `cleanup_days`.
     - Speculative pre-registration keys (see below): `speculative_enabled`, `speculative_lookback_weeks`, `speculative_min_matches`, `speculative_max_weeks_ahead`, `speculative_find_grace_minutes`, `speculative_recheck_hours`, `snapshot_interval_hours`, `observed_retention_days`, `cron_interval_minutes`, `speculative_fast_poll_hours`, `speculative_claim_stale_minutes`.
-    - `notify_webmaster_on_unlisted_request` (default `false`): also email the webmaster when a requested event isn't on the website.
+    - `notify_webmaster_on_unlisted_request` (default `false`): also email the webmaster when a requested event isn't on the website and can't be scheduled speculatively.
 
 - **Website Credentials**:
     - Store per-user website login credentials in `user_tokens/<tag>.json`:
@@ -135,6 +135,8 @@ If you ask for a session that isn't on the website yet, the system checks whethe
 - It rechecks the website every `speculative_recheck_hours`, and on every run for `speculative_fast_poll_hours` after the predicted time. Once the session is posted, it confirms the registration time in your original email thread. If registration opens before the next cron run (`cron_interval_minutes`), it registers in the current run, waiting for the real opening time.
 - If a later week of the same slot is posted first, or the session date arrives and registration time passes without it being posted, it assumes the session was cancelled, drops the request, and tells you.
 - A registration attempt that fails with a real error marks the request `failed` and tells you and the webmaster. It is not retried automatically.
+- Only one event registers per user per registration time. A confirmed booking always keeps its slot: a speculative request that turns out to open at the same time is dropped, and you're told. An explicit add replaces your other events at that time (you're told about any speculative request it replaces), except one that's being registered right now.
+- Emailing an add for an event that's already being registered gets an "already registering" reply and leaves that registration alone.
 
 The schedule history is built by scanning each user's events list every `snapshot_interval_hours`. A failed scan also waits that long before it's retried. There is no backfill, so for the first few weeks matches come mostly from sessions currently listed. Token files must have lowercase names (for example `user_tokens/alice.json`) to be scanned.
 

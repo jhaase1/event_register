@@ -7,7 +7,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
-from website import _parse_month_day, _parse_time_range
+from website import _parse_month_day, _parse_time_range, parse_clock
 from logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -112,16 +112,6 @@ def later_occurrence_listed(observations, event_day, slot):
     )
 
 
-def _parse_clock(text):
-    """'20:00:00' or '20:00' -> time; None if missing or malformed."""
-    for fmt in ("%H:%M:%S", "%H:%M"):
-        try:
-            return datetime.strptime(str(text).strip(), fmt).time()
-        except (TypeError, ValueError):
-            continue
-    return None
-
-
 def _estimate_lead(observations, slot_obs, lead_override):
     if lead_override is not None:
         try:
@@ -195,7 +185,7 @@ def predict(
     if lead_days is None:
         return Rejection("I don't know yet how far ahead registration opens for these sessions.")
 
-    clock = _parse_clock(registration_clock) if registration_clock else None
+    clock = parse_clock(registration_clock) if registration_clock else None
     if clock is None:
         return Rejection("No valid default registration time is configured, so I can't tell when it opens.")
 
