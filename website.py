@@ -95,6 +95,16 @@ def _parse_time_range(text):
     return h1, int(match.group("m1") or 0), h2, int(match.group("m2") or 0)
 
 
+def parse_clock(text):
+    """'20:00:00' or '20:00' -> time; None if malformed."""
+    for fmt in ("%H:%M:%S", "%H:%M"):
+        try:
+            return datetime.strptime(str(text).strip(), fmt).time()
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def _parse_opens_in(text):
     """Parses 'Registration opens in 1 day and 23 h' / '23 h and 49 min' / '45 sec' into a timedelta."""
     matches = OPENS_IN_UNIT_RE.findall(text)
@@ -112,6 +122,14 @@ class SkillLevelIneligible(Exception):
 
     Kept separate from the generic "couldn't determine registration time" outcome
     so callers can reply politely instead of treating this as a system failure.
+    """
+
+
+class EventNotFound(Exception):
+    """Raised when no event card matches the requested date and time range.
+
+    Distinct from "found but couldn't read a registration time" so callers can
+    fall back to speculative pre-registration for sessions not posted yet.
     """
 
 
@@ -276,7 +294,7 @@ class Website:
 
             previous_count = current_count
 
-    def _find_event(self, event_date: str, time_range: str):
+    def _find_event(self, event_date: str, time_range: str, timeout=None):
         """Finds the event card matching the given date and time range.
 
         Site-rendered text ('Tue, Sep 1st, 10a - 12p') and user-typed queries
@@ -300,11 +318,73 @@ class Website:
                     return card
             return False
 
+        wait = self.wait if timeout is None else WebDriverWait(self.driver, timeout=timeout)
         try:
-            return self.wait.until(scan)
+            return wait.until(scan)
         except TimeoutException:
-            logger.error(f"No event found for date: {event_date}, time range: {time_range}")
+            # Short-timeout lookups are polling for a card that may not be
+            # posted yet; a miss there is expected, not an error.
+            log = logger.error if timeout is None else logger.debug
+            log(f"No event found for date: {event_date}, time range: {time_range}")
             return None
+
+    @staticmethod
+    def _card_text(card, selector):
+        elements = card.find_elements(By.CSS_SELECTOR, selector)
+        return elements[0].text.strip() if elements else None
+
+    def scan_listed_events(self):
+        """Parses every loaded event card into plain data.
+
+        Assumes the list is already fully loaded (display_all_events). Reads
+        everything up front so nothing holds a card reference that a later
+        navigation would make stale.
+        """
+        scanned = []
+        for card in self.driver.find_elements(By.CSS_SELECTOR, EVENT_CARD):
+            dt_text = self._card_text(card, DATE_TIME_SECTION)
+            if not dt_text:
+                continue
+            month_day = _parse_month_day(dt_text)
+            time_tuple = _parse_time_range(dt_text)
+            if not month_day or not time_tuple:
+                continue
+
+            register_label = (self._card_text(card, REGISTER_BTN) or "").lower()
+            dropin_text = self._card_text(card, DROPIN_MSG)
+            scanned.append(
+                {
+                    "month_day": month_day,
+                    "time": time_tuple,
+                    "name": self._card_text(card, EVENT_NAME),
+                    "category": self._card_text(card, CATEGORY_NAME),
+                    "actionable": bool(register_label) and register_label != "details",
+                    "opens_in": _parse_opens_in(dropin_text) if dropin_text else None,
+                }
+            )
+        logger.info(f"Scanned {len(scanned)} listed event(s).")
+        return scanned
+
+    def find_event_url(self, event_date: str, time_range: str, until: datetime, poll_seconds=10):
+        """Like get_event_url, but keeps reloading the list until `until`.
+
+        For speculative registrations the session may only be posted at the
+        moment registration opens, so a single lookup isn't enough. Always
+        tries at least once. Returns None if it never shows up.
+        """
+        while True:
+            self.display_all_events()
+            event = self._find_event(event_date, time_range, timeout=2)
+            if event:
+                buttons = event.find_elements(By.CSS_SELECTOR, REGISTER_BTN)
+                href = buttons[0].get_attribute("href") if buttons else None
+                if href:
+                    logger.info(f"Speculative event posted: {href}")
+                    return href
+            if datetime.now() >= until:
+                logger.info(f"Event {event_date} {time_range} not posted by {until}.")
+                return None
+            time.sleep(poll_seconds)
 
     def _card_summary(self, event):
         """Builds a human-readable summary line from an event card's visible fields."""
@@ -349,10 +429,8 @@ class Website:
         self.display_all_events()
         event = self._find_event(event_date, time_range)
         if not event:
-            logger.error(
-                f"No event found for date: {event_date}, time range: {time_range}"
-            )
-            return None, None
+            # The list page is still loaded, so callers can scan it right away.
+            raise EventNotFound(f"No event found for date: {event_date}, time range: {time_range}")
 
         # Everything needed from the card must be read now: checking the skill
         # restriction navigates away from the list page, which would leave
@@ -390,8 +468,13 @@ class Website:
         date = datetime.now() + opens_in
         logger.debug(f"Registration opens in {opens_in}, landing on {date}.")
 
-        if registration_time:
-            reg_time = datetime.strptime(registration_time, "%H:%M:%S").time()
+        reg_time = parse_clock(registration_time) if registration_time else None
+        if registration_time and reg_time is None:
+            logger.warning(
+                f"Ignoring malformed default_registration_time {registration_time!r}; "
+                "using the countdown time as is."
+            )
+        if reg_time:
             date = date.replace(
                 hour=reg_time.hour,
                 minute=reg_time.minute,
@@ -437,6 +520,8 @@ class Website:
         else:
             self.display_all_events()
             event = self._find_event(event_date, time_range)
+            if not event:
+                raise EventNotFound(f"No event found for date: {event_date}, time range: {time_range}")
             register_link = event.find_element(By.CSS_SELECTOR, REGISTER_BTN)
 
         signup_url = register_link.get_attribute("href")

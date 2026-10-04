@@ -187,6 +187,24 @@ def get_website_token_file(user_tag="default"):
     return os.path.join("user_tokens", f"{user_tag}.json")
 
 
+def list_user_tags(tokens_dir="user_tokens"):
+    """Returns every configured user tag (one per token file), lowercased and sorted."""
+    if not os.path.isdir(tokens_dir):
+        return []
+    tags = []
+    for name in os.listdir(tokens_dir):
+        tag, ext = os.path.splitext(name)
+        if ext != ".json" or not re.match(r'^[a-zA-Z0-9_-]+$', tag):
+            continue
+        # Logins look up user_tokens/<lowercase tag>.json, which won't find
+        # "Alice.json" on a case-sensitive filesystem.
+        if tag != tag.lower():
+            logger.warning(f"Skipping token file '{name}': user token filenames must be lowercase.")
+            continue
+        tags.append(tag)
+    return sorted(tags)
+
+
 def validate_user_tag(user_tag):
     """Validates that a user tag is safe and has a corresponding token file.
     
