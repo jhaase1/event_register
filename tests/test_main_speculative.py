@@ -1310,13 +1310,13 @@ def test_valid_poll_offsets_are_kept(tmp_path, offsets):
 
 @pytest.mark.parametrize("offsets", [[], ["-10", 1], 1, None, [True, 1], "[-10, 1]"])
 def test_invalid_poll_offsets_fall_back_to_default(tmp_path, offsets):
-    assert _load_config_with(tmp_path, offsets)["speculative_poll_offsets_seconds"] == [-10, 1]
+    assert _load_config_with(tmp_path, offsets)["speculative_poll_offsets_seconds"] == main.DEFAULT_APP_CONFIG["speculative_poll_offsets_seconds"]
 
 
 def test_missing_poll_offsets_key_uses_default(tmp_path):
     path = tmp_path / "app_config.json"
     path.write_text('{"speculative_find_grace_minutes": 5}')
-    assert main.load_app_config(str(path))["speculative_poll_offsets_seconds"] == [-10, 1]
+    assert main.load_app_config(str(path))["speculative_poll_offsets_seconds"] == main.DEFAULT_APP_CONFIG["speculative_poll_offsets_seconds"]
 
 
 def _dwell_spy(monkeypatch):
@@ -1393,7 +1393,7 @@ def test_scheduled_registration_not_due_when_far_off(db_path):
 
 @pytest.mark.parametrize("offsets", [[-30], [-10, -1]])
 def test_all_negative_poll_offsets_fall_back_to_default(tmp_path, offsets):
-    assert _load_config_with(tmp_path, offsets)["speculative_poll_offsets_seconds"] == [-10, 1]
+    assert _load_config_with(tmp_path, offsets)["speculative_poll_offsets_seconds"] == main.DEFAULT_APP_CONFIG["speculative_poll_offsets_seconds"]
 
 
 def test_zero_offset_counts_as_at_opening(tmp_path):
@@ -1505,3 +1505,10 @@ def test_plain_not_posted_does_not_alert_the_owner(monkeypatch, db_path):
     main.register_for_next_event(headless=True)
 
     assert client.notifications == []
+
+
+def test_default_poll_schedule_starts_before_opening_and_keeps_looking_for_a_minute():
+    offsets = main.DEFAULT_APP_CONFIG["speculative_poll_offsets_seconds"]
+    assert offsets == [-10, 1, 3, 6, 10, 20, 40, 60]
+    assert min(offsets) < 0 <= max(offsets)
+    assert main._valid_poll_offsets(offsets) == offsets

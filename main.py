@@ -41,7 +41,7 @@ DEFAULT_APP_CONFIG = {
     "speculative_max_weeks_ahead": 3,
     # Seconds relative to the predicted opening at which the scheduler
     # reloads the list looking for a speculative session (negative = before).
-    "speculative_poll_offsets_seconds": [-10, 1],
+    "speculative_poll_offsets_seconds": [-10, 1, 3, 6, 10, 20, 40, 60],
     "speculative_recheck_hours": 6,
     "snapshot_interval_hours": 6,
     "observed_retention_days": 42,
