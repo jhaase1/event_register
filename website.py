@@ -155,15 +155,20 @@ class Website:
         else:
             self.driver = webdriver.Chrome()
 
-        # Selenium's default page-load timeout is 300 s; a hung load must not
-        # block a time-critical registration that long.
-        self.driver.set_page_load_timeout(60)
+        try:
+            # Selenium's default page-load timeout is 300 s; a hung load must
+            # not block a time-critical registration that long.
+            self.driver.set_page_load_timeout(60)
 
-        self.logged_in = False
-        self.user_tag = None
+            self.logged_in = False
+            self.user_tag = None
 
-        self.wait_time = wait_time
-        self.wait = WebDriverWait(self.driver, timeout=self.wait_time)
+            self.wait_time = wait_time
+            self.wait = WebDriverWait(self.driver, timeout=self.wait_time)
+        except Exception:
+            # The caller never gets this object, so it can't close Chrome.
+            self.driver.quit()
+            raise
         logger.info("Web driver initialized.")
 
     def login(self, user_tag=None):

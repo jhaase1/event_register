@@ -1475,5 +1475,33 @@ def test_speculative_login_timeout_end_to_end_keeps_row_speculative(monkeypatch,
     db = _open(db_path)
     assert len(db.get_speculative_events()) == 1
     db.close()
-    assert client.notifications == []
+    assert len(client.notifications) == 1  # owner alerted; row still retryable
     assert "couldn't load the events list" in client.replies[0].body
+
+
+def test_speculative_login_failure_still_alerts_the_owner(monkeypatch, db_path):
+    _seed_speculative(db_path, registration_time=datetime.now() + timedelta(minutes=5))
+    client = FakeEmailClient()
+    monkeypatch.setattr(main, "EmailClient", lambda: client)
+    monkeypatch.setattr(main, "is_within_offset", lambda *_a, **_k: True)
+    monkeypatch.setattr(main, "dwell_until", lambda *_a, **_k: None)
+    monkeypatch.setattr(main, "Website", _LoginTimesOutSite)
+
+    main.register_for_next_event(headless=True)
+
+    assert len(client.notifications) == 1
+    assert client.notifications[0][0] == "Event registration failed"
+    db = _open(db_path)
+    assert len(db.get_speculative_events()) == 1  # still retryable
+    db.close()
+
+
+def test_plain_not_posted_does_not_alert_the_owner(monkeypatch, db_path):
+    _seed_speculative(db_path, registration_time=datetime.now() + timedelta(minutes=5))
+    client = _wire_registration(
+        monkeypatch, db_path, {"success": False, "speculative_not_found": True, "error": "x"}
+    )
+
+    main.register_for_next_event(headless=True)
+
+    assert client.notifications == []

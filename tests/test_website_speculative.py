@@ -597,3 +597,23 @@ def test_login_loads_its_page_with_retry(monkeypatch, tmp_path):
     with pytest.raises(website.TimeoutException):
         site.login("default")
     assert loaded == ["https://x/login"]
+
+
+def test_chrome_is_quit_if_setup_after_launch_fails(monkeypatch):
+    class FakeChrome:
+        quit_called = False
+
+        def __init__(self, *a, **k):
+            pass
+
+        def set_page_load_timeout(self, seconds):
+            raise RuntimeError("driver rejected timeout")
+
+        def quit(self):
+            FakeChrome.quit_called = True
+
+    monkeypatch.setattr(website.webdriver, "Chrome", FakeChrome)
+
+    with pytest.raises(RuntimeError):
+        website.Website(headless=False)
+    assert FakeChrome.quit_called

@@ -166,6 +166,9 @@ def register_for_single_event(
                     "success": False,
                     "speculative_not_found": True,
                     "list_unavailable": True,
+                    # Still alert the owner: a changed password or broken
+                    # chromedriver would otherwise fail silently.
+                    "browser_error": True,
                     "error": f"login failed: {e}",
                     "registration_time": registration_time,
                 }
@@ -397,7 +400,11 @@ def register_for_next_event(headless=True):
             except Exception as e:
                 logger.error(f"Failed to send follow-up for {r['event']}: {e}", exc_info=True)
 
-    _notify_registration_failures(failed, headless)
+    # Browser/login errors on speculative rows stay retryable, but the owner
+    # is still told, since they often mean a broken setup.
+    _notify_registration_failures(
+        failed + [r for r in not_posted if r.get("browser_error")], headless
+    )
 
     logger.info("Removing old events from the database.")
     events.remove_old_events(n_days=cleanup_days)
