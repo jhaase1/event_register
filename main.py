@@ -38,7 +38,9 @@ DEFAULT_APP_CONFIG = {
     "speculative_lookback_weeks": 4,
     "speculative_min_matches": 1,
     "speculative_max_weeks_ahead": 3,
-    "speculative_find_grace_minutes": 5,
+    # Seconds relative to the predicted opening at which the scheduler
+    # reloads the list looking for a speculative session (negative = before).
+    "speculative_poll_offsets_seconds": [-10, 1],
     "speculative_recheck_hours": 6,
     "snapshot_interval_hours": 6,
     "observed_retention_days": 42,
@@ -78,7 +80,26 @@ def load_app_config(config_file=APP_CONFIG_FILE):
         loaded_config = json.load(file)
 
     config.update(loaded_config)
+    config["speculative_poll_offsets_seconds"] = _valid_poll_offsets(
+        config["speculative_poll_offsets_seconds"]
+    )
     return config
+
+
+def _valid_poll_offsets(value):
+    """A non-empty list of numbers, or the default. A bad value must not break
+    a registration at the critical moment, so it's replaced at load time."""
+    if (
+        isinstance(value, list)
+        and value
+        and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in value)
+    ):
+        return value
+    default = DEFAULT_APP_CONFIG["speculative_poll_offsets_seconds"]
+    logger.warning(
+        f"Invalid speculative_poll_offsets_seconds {value!r}; using the default {default}."
+    )
+    return list(default)
 
 
 APP_CONFIG = load_app_config()
@@ -127,15 +148,17 @@ def register_for_single_event(
         website = Website(headless=headless)
         website.login(user_tag=user_tag)
         if status == "speculative":
-            # The session may only get posted the moment registration opens,
-            # so keep looking for it a little past the predicted time.
-            deadline = registration_time + timedelta(
-                minutes=APP_CONFIG["speculative_find_grace_minutes"]
-            )
-            event_url = website.find_event_url(event_date, time_range, until=deadline)
+            # The session may only get posted the moment registration opens
+            # and can fill within seconds, so look for it at configured
+            # moments around the predicted opening.
+            poll_times = [
+                registration_time + timedelta(seconds=offset)
+                for offset in APP_CONFIG["speculative_poll_offsets_seconds"]
+            ]
+            event_url = website.find_event_url(event_date, time_range, poll_times=poll_times)
             if not event_url:
                 logger.info(
-                    f"Speculative event for user '{user_tag}' not posted by {deadline}: {event_date} {time_range}"
+                    f"Speculative event for user '{user_tag}' not posted by {max(poll_times, default=registration_time)}: {event_date} {time_range}"
                 )
                 _record_result(
                     {
@@ -151,11 +174,16 @@ def register_for_single_event(
         else:
             event_url = website.get_event_url(event_date, time_range)
 
-        delay = random.uniform(MIN_DELAY, MAX_DELAY)
-        logger.info(
-            f"Waiting until registration time for user '{user_tag}' (delay: {delay:.2f}s)"
-        )
-        dwell_until(registration_time, offset_seconds=-delay)
+        if status == "speculative" and datetime.now() >= registration_time:
+            # Found only after opening: it's already a race, so don't add the
+            # usual post-opening delay.
+            logger.info(f"Registration already open for user '{user_tag}'; registering now.")
+        else:
+            delay = random.uniform(MIN_DELAY, MAX_DELAY)
+            logger.info(
+                f"Waiting until registration time for user '{user_tag}' (delay: {delay:.2f}s)"
+            )
+            dwell_until(registration_time, offset_seconds=-delay)
 
         logger.info(
             f"Registering for event (user '{user_tag}'): {event_date} {time_range}"
@@ -1272,15 +1300,43 @@ def _refresh_schedule_and_confirm_speculative(headless):
     events.close()
 
 
+def _scheduled_registration_due():
+    """True if the next scheduled registration's hold window is already open."""
+    try:
+        events = Events()
+        try:
+            next_events = events.get_next_event_after()
+        finally:
+            events.close()
+    except Exception:
+        logger.exception("Could not check for a due scheduled registration")
+        return False
+    return bool(next_events) and is_within_offset(
+        next_events[0]["registration_time"], offset_minutes=HOLD_BUFFER
+    )
+
+
 def run(headless):
     """One cron cycle: read email, run scheduled registrations, then
     register anything that was already open when emailed."""
     pending_open = []
+
+    # Reading email visits the website once per command and can take minutes
+    # when the site is slow. If a scheduled registration's hold window is
+    # already open, run it first so email can't push it past the opening.
+    if _scheduled_registration_due():
+        try:
+            register_for_next_event(headless=headless)
+        except Exception as e:
+            logger.error(f"Scheduled registration failed: {e}", exc_info=True)
+
     try:
         check_for_new_event(headless=headless, pending_open=pending_open)
     except Exception as e:
         logger.error(f"An error occurred: {e}")
 
+    # Picks up anything due that email just added (or the usual case, when
+    # nothing was due before email).
     try:
         register_for_next_event(headless=headless)
     except Exception as e:

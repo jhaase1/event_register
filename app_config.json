@@ -8,7 +8,7 @@
     "speculative_lookback_weeks": 4,
     "speculative_min_matches": 1,
     "speculative_max_weeks_ahead": 3,
-    "speculative_find_grace_minutes": 5,
+    "speculative_poll_offsets_seconds": [-10, 1],
     "speculative_recheck_hours": 6,
     "snapshot_interval_hours": 6,
     "observed_retention_days": 42,

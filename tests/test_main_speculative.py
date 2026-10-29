@@ -498,8 +498,10 @@ class FakeRegisterSite:
     def get_event_url(self, event_date, time_range):
         raise AssertionError("speculative rows must poll with find_event_url")
 
-    def find_event_url(self, event_date, time_range, until, poll_seconds=10):
-        self.until = until
+    poll_times = None
+
+    def find_event_url(self, event_date, time_range, poll_times):
+        FakeRegisterSite.poll_times = poll_times
         return FakeRegisterSite.url
 
     def register_for_event(self, event_date, time_range, event_url):
@@ -545,6 +547,23 @@ def test_speculative_registration_posted_registers(monkeypatch):
 
     assert FakeRegisterSite.registered == ["https://x/Details/1"]
     assert results[0]["success"] is True
+
+
+@pytest.mark.parametrize("offsets", [[-10, 1], [-30, -5, 0, 1, 3, 10]])
+def test_speculative_registration_polls_at_configured_offsets_from_opening(monkeypatch, offsets):
+    monkeypatch.setitem(main.APP_CONFIG, "speculative_poll_offsets_seconds", offsets)
+    FakeRegisterSite.url = None
+    FakeRegisterSite.registered = []
+    monkeypatch.setattr(main, "Website", FakeRegisterSite)
+    monkeypatch.setattr(main, "dwell_until", lambda *_a, **_k: None)
+    info = _speculative_info()
+    opens = datetime(2026, 10, 26, 20, 0, 0)
+    info["registration_time"] = opens
+
+    main.register_for_single_event(info, results=[])
+
+    assert FakeRegisterSite.poll_times == [opens + timedelta(seconds=s) for s in offsets]
+
 
 
 def _wire_registration(monkeypatch, db_path, result):
@@ -1271,3 +1290,99 @@ def test_webmaster_not_notified_when_speculative_request_is_accepted(monkeypatch
 
     assert "isn't posted" in client.replies[0].body
     assert client.notifications == []
+
+
+# --- round-1 polling review: config, waits, run order -------------------------
+
+
+def _load_config_with(tmp_path, offsets):
+    import json as _json
+
+    path = tmp_path / "app_config.json"
+    path.write_text(_json.dumps({"speculative_poll_offsets_seconds": offsets}))
+    return main.load_app_config(str(path))
+
+
+@pytest.mark.parametrize("offsets", [[-10, 1], [-30, -2.5, 0, 1, 5]])
+def test_valid_poll_offsets_are_kept(tmp_path, offsets):
+    assert _load_config_with(tmp_path, offsets)["speculative_poll_offsets_seconds"] == offsets
+
+
+@pytest.mark.parametrize("offsets", [[], ["-10", 1], 1, None, [True, 1], "[-10, 1]"])
+def test_invalid_poll_offsets_fall_back_to_default(tmp_path, offsets):
+    assert _load_config_with(tmp_path, offsets)["speculative_poll_offsets_seconds"] == [-10, 1]
+
+
+def test_missing_poll_offsets_key_uses_default(tmp_path):
+    path = tmp_path / "app_config.json"
+    path.write_text('{"speculative_find_grace_minutes": 5}')
+    assert main.load_app_config(str(path))["speculative_poll_offsets_seconds"] == [-10, 1]
+
+
+def _dwell_spy(monkeypatch):
+    dwells = []
+    monkeypatch.setattr(main, "dwell_until", lambda *a, **k: dwells.append((a, k)))
+    return dwells
+
+
+def test_speculative_hit_after_opening_registers_without_extra_delay(monkeypatch):
+    FakeRegisterSite.url = "https://x/Details/1"
+    FakeRegisterSite.registered = []
+    monkeypatch.setattr(main, "Website", FakeRegisterSite)
+    dwells = _dwell_spy(monkeypatch)
+    info = _speculative_info()
+    info["registration_time"] = datetime.now() - timedelta(seconds=2)
+
+    main.register_for_single_event(info, results=[])
+
+    assert dwells == []
+    assert FakeRegisterSite.registered == ["https://x/Details/1"]
+
+
+def test_speculative_hit_before_opening_still_waits_for_opening(monkeypatch):
+    FakeRegisterSite.url = "https://x/Details/1"
+    FakeRegisterSite.registered = []
+    monkeypatch.setattr(main, "Website", FakeRegisterSite)
+    dwells = _dwell_spy(monkeypatch)
+    info = _speculative_info()
+    info["registration_time"] = datetime.now() + timedelta(seconds=30)
+
+    main.register_for_single_event(info, results=[])
+
+    assert len(dwells) == 1
+    assert dwells[0][0][0] == info["registration_time"]
+
+
+def _run_with_spies(monkeypatch, due):
+    calls = []
+    monkeypatch.setattr(main, "_scheduled_registration_due", lambda: due)
+    monkeypatch.setattr(main, "check_for_new_event", lambda headless=True, pending_open=None: calls.append("email"))
+    monkeypatch.setattr(main, "register_for_next_event", lambda headless=True: calls.append("scheduler"))
+    monkeypatch.setattr(main, "register_open_events", lambda pending, headless=True: calls.append("open"))
+    monkeypatch.setattr(
+        main, "refresh_schedule_and_confirm_speculative", lambda headless=True: calls.append("refresh")
+    )
+    main.run(headless=True)
+    return calls
+
+
+def test_run_holds_before_reading_email_when_a_registration_is_due(monkeypatch):
+    assert _run_with_spies(monkeypatch, due=True) == ["scheduler", "email", "scheduler", "open", "refresh"]
+
+
+def test_run_reads_email_first_when_nothing_is_due(monkeypatch):
+    assert _run_with_spies(monkeypatch, due=False) == ["email", "scheduler", "open", "refresh"]
+
+
+def test_scheduled_registration_due_checks_the_hold_window(db_path):
+    db = _open(db_path)
+    db.insert_event("Soon", "9a - 11a", datetime.now() + timedelta(minutes=5), "default")
+    db.close()
+    assert main._scheduled_registration_due() is True
+
+
+def test_scheduled_registration_not_due_when_far_off(db_path):
+    db = _open(db_path)
+    db.insert_event("Later", "9a - 11a", datetime.now() + timedelta(hours=3), "default")
+    db.close()
+    assert main._scheduled_registration_due() is False

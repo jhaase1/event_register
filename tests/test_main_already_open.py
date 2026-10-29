@@ -235,6 +235,8 @@ def test_run_registers_open_events_after_the_scheduler(monkeypatch):
 
     monkeypatch.setattr(main, "check_for_new_event", fake_check)
     monkeypatch.setattr(main, "register_for_next_event", lambda headless=True: calls.append("scheduler"))
+    monkeypatch.setattr(main, "_scheduled_registration_due", lambda: False)
+    monkeypatch.setattr(main, "refresh_schedule_and_confirm_speculative", lambda headless=True: None)
     monkeypatch.setattr(
         main, "register_open_events", lambda pending, headless=True: calls.append(("open", len(pending)))
     )
@@ -256,6 +258,8 @@ def test_run_still_registers_open_events_when_earlier_steps_fail(monkeypatch):
 
     monkeypatch.setattr(main, "check_for_new_event", failing_check)
     monkeypatch.setattr(main, "register_for_next_event", failing_scheduler)
+    monkeypatch.setattr(main, "_scheduled_registration_due", lambda: False)
+    monkeypatch.setattr(main, "refresh_schedule_and_confirm_speculative", lambda headless=True: None)
     monkeypatch.setattr(
         main, "register_open_events", lambda pending, headless=True: calls.append(len(pending))
     )
