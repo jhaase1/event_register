@@ -122,45 +122,103 @@ class _Event:
         return [self._btn] if self._btn else []
 
 
-def _polling_site(monkeypatch, results):
-    """results: sequence returned by successive _find_event calls."""
-    site = website.Website.__new__(website.Website)
-    calls = {"display": 0, "find": 0, "sleeps": []}
-    remaining = list(results)
+OPENS = datetime(2026, 10, 26, 20, 0, 0)
+POLLS = [OPENS - timedelta(seconds=10), OPENS + timedelta(seconds=1)]
 
-    def display():
-        calls["display"] += 1
+
+def _polling_site(monkeypatch, results, start=None, load_seconds=0, visible_before_scroll=True):
+    """results: one entry per poll: what the lookup finds (None for a miss), or
+    an exception the page load raises. Uses a fake clock that sleep() and each
+    page load (load_seconds) advance."""
+    site = website.Website.__new__(website.Website)
+    clock = {"now": start or OPENS - timedelta(minutes=1)}
+    calls = {"polled_at": [], "loads": [], "scrolls": 0}
+    remaining = list(results)
+    current = {"event": None, "scrolled": False}
+
+    class FakeDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock["now"]
+
+    def go_to_events_page(attempts=3, wait_time=None):
+        calls["polled_at"].append(clock["now"])
+        calls["loads"].append((attempts, wait_time))
+        clock["now"] += timedelta(seconds=load_seconds)
+        result = remaining.pop(0) if remaining else None
+        if isinstance(result, Exception):
+            raise result
+        current.update(event=result, scrolled=False)
+
+    def scroll():
+        calls["scrolls"] += 1
+        current["scrolled"] = True
 
     def find(event_date, time_range, timeout=None):
-        calls["find"] += 1
-        return remaining.pop(0) if remaining else None
+        if visible_before_scroll or current["scrolled"]:
+            return current["event"]
+        return None
 
-    site.display_all_events = display
+    site._go_to_events_page = go_to_events_page
+    site._display_all_events_by_scrolling = scroll
     site._find_event = find
-    monkeypatch.setattr(website.time, "sleep", lambda s: calls["sleeps"].append(s))
+    monkeypatch.setattr(website, "datetime", FakeDatetime)
+    monkeypatch.setattr(
+        website.time, "sleep", lambda s: clock.__setitem__("now", clock["now"] + timedelta(seconds=s))
+    )
     return site, calls
 
 
-def test_find_event_url_returns_href_once_posted(monkeypatch):
-    site, calls = _polling_site(monkeypatch, [None, None, _Event("https://x/Details/1")])
+def test_find_event_url_polls_before_then_after_opening(monkeypatch):
+    site, calls = _polling_site(monkeypatch, [None, _Event("https://x/Details/1")])
 
-    url = site.find_event_url("Tue, Oct 13", "9a - 11a", until=datetime.now() + timedelta(minutes=5), poll_seconds=7)
+    url = site.find_event_url("Mon, Nov 2nd", "9:30a - 11a", poll_times=POLLS)
 
     assert url == "https://x/Details/1"
-    assert calls["display"] == 3
-    assert calls["sleeps"] == [7, 7]
+    assert calls["polled_at"] == POLLS
 
 
-def test_find_event_url_keeps_polling_when_card_has_no_link_or_button(monkeypatch):
+def test_find_event_url_stops_at_first_sighting(monkeypatch):
+    site, calls = _polling_site(monkeypatch, [_Event("https://x/Details/1")])
+
+    assert site.find_event_url("Mon, Nov 2nd", "9:30a - 11a", poll_times=POLLS) == "https://x/Details/1"
+    assert calls["polled_at"] == [POLLS[0]]
+
+
+def test_find_event_url_returns_none_after_last_poll(monkeypatch):
+    site, calls = _polling_site(monkeypatch, [])
+
+    assert site.find_event_url("Mon, Nov 2nd", "9:30a - 11a", poll_times=POLLS) is None
+    assert calls["polled_at"] == POLLS
+
+
+def test_find_event_url_honours_any_configured_schedule_in_order(monkeypatch):
+    site, calls = _polling_site(monkeypatch, [])
+    offsets = [5, -10, 1, -2, 30]
+    times = [OPENS + timedelta(seconds=s) for s in offsets]
+
+    site.find_event_url("Mon, Nov 2nd", "9:30a - 11a", poll_times=times)
+
+    assert calls["polled_at"] == sorted(times)
+
+
+def test_find_event_url_polls_past_times_immediately(monkeypatch):
+    late = OPENS + timedelta(seconds=30)
+    site, calls = _polling_site(monkeypatch, [], start=late)
+
+    assert site.find_event_url("Mon, Nov 2nd", "9:30a - 11a", poll_times=POLLS) is None
+    assert calls["polled_at"] == [late, late]
+
+
+def test_find_event_url_treats_card_without_link_or_button_as_not_posted(monkeypatch):
     site, calls = _polling_site(
         monkeypatch,
         [_Event(None), _Event("ignored", has_button=False), _Event("https://x/Details/2")],
     )
+    times = POLLS + [OPENS + timedelta(seconds=5)]
 
-    url = site.find_event_url("Tue, Oct 13", "9a - 11a", until=datetime.now() + timedelta(minutes=5))
-
-    assert url == "https://x/Details/2"
-    assert calls["find"] == 3
+    assert site.find_event_url("Mon, Nov 2nd", "9:30a - 11a", poll_times=times) == "https://x/Details/2"
+    assert len(calls["polled_at"]) == 3
 
 
 def test_find_event_miss_logs_at_debug_when_polling(monkeypatch, caplog):
@@ -179,35 +237,6 @@ def test_find_event_miss_logs_at_debug_when_polling(monkeypatch, caplog):
 
     assert site._find_event("Tue, Oct 13", "9a - 11a", timeout=2) is None
     assert not [r for r in caplog.records if r.levelname == "ERROR"]
-
-
-def test_find_event_url_tries_once_even_when_deadline_passed(monkeypatch):
-    site, calls = _polling_site(monkeypatch, [])
-
-    url = site.find_event_url("Tue, Oct 13", "9a - 11a", until=datetime.now() - timedelta(seconds=1))
-
-    assert url is None
-    assert calls["find"] == 1
-
-
-def test_find_event_url_gives_up_at_deadline(monkeypatch):
-    site, calls = _polling_site(monkeypatch, [])
-    clock = {"now": datetime(2026, 10, 6, 14, 0, 0)}
-
-    class FakeDatetime(datetime):
-        @classmethod
-        def now(cls, tz=None):
-            return clock["now"]
-
-    monkeypatch.setattr(website, "datetime", FakeDatetime)
-    monkeypatch.setattr(website.time, "sleep", lambda s: clock.__setitem__("now", clock["now"] + timedelta(seconds=s)))
-
-    url = site.find_event_url(
-        "Tue, Oct 13", "9a - 11a", until=datetime(2026, 10, 6, 14, 1, 0), poll_seconds=20
-    )
-
-    assert url is None
-    assert calls["find"] == 4  # t = 0, 20, 40, 60
 
 
 # --- EventNotFound ----------------------------------------------------------
@@ -276,3 +305,315 @@ def test_determine_access_date_accepts_clock_without_seconds():
 def test_determine_access_date_ignores_malformed_clock_instead_of_raising():
     when, _summary = _countdown_site("8pm").determine_access_date("Tue, Oct 13", "9a - 11a")
     assert when is not None
+
+
+# --- slow page loads while polling (Oct 26 failure) ---------------------------
+
+
+def test_find_event_url_page_load_timeout_is_just_a_missed_poll(monkeypatch):
+    site, calls = _polling_site(
+        monkeypatch,
+        [website.TimeoutException("events list didn't render"), _Event("https://x/Details/3")],
+    )
+
+    url = site.find_event_url("Mon, Nov 2nd", "9:30a - 11a", poll_times=POLLS)
+
+    assert url == "https://x/Details/3"
+    assert calls["polled_at"] == POLLS
+
+
+def test_find_event_url_repeated_timeouts_return_none_instead_of_raising(monkeypatch):
+    site, calls = _polling_site(
+        monkeypatch,
+        [website.TimeoutException("slow"), website.TimeoutException("slow")],
+    )
+
+    # None -> "not posted": the row stays speculative instead of being marked failed.
+    assert site.find_event_url("Mon, Nov 2nd", "9:30a - 11a", poll_times=POLLS) is None
+    assert len(calls["polled_at"]) == 2
+
+
+class _LoadDriver:
+    def __init__(self):
+        self.gets = 0
+
+    def get(self, url):
+        self.gets += 1
+
+
+class _FlakyWait:
+    def __init__(self, failures):
+        self.failures = failures
+
+    def until(self, _condition):
+        if self.failures > 0:
+            self.failures -= 1
+            raise website.TimeoutException("slow")
+        return True
+
+
+def _events_page_site(failures):
+    site = website.Website.__new__(website.Website)
+    site.events_url = "https://x/Events"
+    site.driver = _LoadDriver()
+    site.wait = _FlakyWait(failures)
+    return site
+
+
+def test_events_page_reloads_after_a_slow_render():
+    site = _events_page_site(failures=2)
+    site._go_to_events_page()
+    assert site.driver.gets == 3
+
+
+def test_events_page_gives_up_after_three_slow_renders():
+    site = _events_page_site(failures=3)
+    with pytest.raises(website.TimeoutException):
+        site._go_to_events_page()
+    assert site.driver.gets == 3
+
+
+# --- round-1 review: quick looks, overruns, dead sessions --------------------
+
+
+def test_each_poll_is_one_page_load_and_only_the_last_gets_the_full_wait(monkeypatch):
+    site, calls = _polling_site(monkeypatch, [])
+    times = POLLS + [OPENS + timedelta(seconds=5)]
+
+    site.find_event_url("Mon, Nov 2nd", "9:30a - 11a", poll_times=times, page_wait=7)
+
+    # None = the default (full) wait: nothing comes after the last poll, so a
+    # slow render is worth waiting out.
+    assert calls["loads"] == [(1, 7), (1, 7), (1, None)]
+
+
+def test_poll_skips_full_scroll_when_card_is_among_first_rendered(monkeypatch):
+    site, calls = _polling_site(monkeypatch, [_Event("https://x/Details/1")])
+
+    site.find_event_url("Mon, Nov 2nd", "9:30a - 11a", poll_times=POLLS)
+
+    assert calls["scrolls"] == 0
+
+
+def test_poll_scrolls_for_cards_further_down(monkeypatch):
+    site, calls = _polling_site(
+        monkeypatch, [_Event("https://x/Details/1")], visible_before_scroll=False
+    )
+
+    assert site.find_event_url("Mon, Nov 2nd", "9:30a - 11a", poll_times=POLLS) == "https://x/Details/1"
+    assert calls["scrolls"] == 1
+
+
+def test_slow_poll_overrunning_the_next_time_runs_the_next_poll_right_away(monkeypatch):
+    # The -10 s load takes 15 s, finishing at +5 s, past the +1 s slot.
+    site, calls = _polling_site(monkeypatch, [], load_seconds=15)
+
+    site.find_event_url("Mon, Nov 2nd", "9:30a - 11a", poll_times=POLLS)
+
+    assert calls["polled_at"] == [POLLS[0], OPENS + timedelta(seconds=5)]
+
+
+def test_dead_browser_session_stops_polling(monkeypatch):
+    site, calls = _polling_site(monkeypatch, [website.InvalidSessionIdException("session deleted")])
+
+    assert site.find_event_url("Mon, Nov 2nd", "9:30a - 11a", poll_times=POLLS) is None
+    assert len(calls["polled_at"]) == 1
+
+
+def test_other_webdriver_errors_are_a_missed_poll(monkeypatch):
+    site, calls = _polling_site(
+        monkeypatch, [website.WebDriverException("net::ERR_CONNECTION_RESET"), _Event("https://x/Details/4")]
+    )
+
+    assert site.find_event_url("Mon, Nov 2nd", "9:30a - 11a", poll_times=POLLS) == "https://x/Details/4"
+
+
+class _FlakyGetDriver(_LoadDriver):
+    def __init__(self, failures):
+        super().__init__()
+        self.failures = failures
+
+    def get(self, url):
+        super().get(url)
+        if self.failures > 0:
+            self.failures -= 1
+            raise website.TimeoutException("page load timed out")
+
+
+def test_events_page_retries_when_the_page_load_itself_times_out():
+    site = _events_page_site(failures=0)
+    site.driver = _FlakyGetDriver(failures=1)
+    site._go_to_events_page()
+    assert site.driver.gets == 2
+
+
+def test_events_page_uses_a_short_wait_when_asked(monkeypatch):
+    site = _events_page_site(failures=0)
+    used = []
+
+    class RecordingWait:
+        def __init__(self, driver, timeout):
+            used.append(timeout)
+
+        def until(self, _condition):
+            return True
+
+    monkeypatch.setattr(website, "WebDriverWait", RecordingWait)
+    site._go_to_events_page(attempts=1, wait_time=8)
+    assert used == [8]
+
+
+# --- round-2 review -----------------------------------------------------------
+
+
+def test_list_seen_flag_false_when_no_poll_rendered_the_list(monkeypatch):
+    site, _calls = _polling_site(
+        monkeypatch, [website.TimeoutException("slow"), website.TimeoutException("slow")]
+    )
+    site.find_event_url("Mon, Nov 2nd", "9:30a - 11a", poll_times=POLLS)
+    assert site.list_seen_while_polling is False
+
+
+def test_list_seen_flag_true_when_a_poll_rendered_the_list(monkeypatch):
+    site, _calls = _polling_site(monkeypatch, [website.TimeoutException("slow"), None])
+    site.find_event_url("Mon, Nov 2nd", "9:30a - 11a", poll_times=POLLS)
+    assert site.list_seen_while_polling is True
+
+
+def test_real_poll_path_treats_render_timeouts_as_misses(monkeypatch):
+    # Runs the real _poll_for_event/_go_to_events_page with a fake driver whose
+    # list never renders, rather than faking those methods.
+    site = _events_page_site(failures=0)
+    clock = {"now": OPENS - timedelta(minutes=1)}
+    waits = []
+
+    class FakeDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock["now"]
+
+    class NeverRenders:
+        def __init__(self, driver, timeout, **_kwargs):
+            waits.append(timeout)
+
+        def until(self, _condition):
+            raise website.TimeoutException("list never rendered")
+
+    site.wait = NeverRenders(None, 30)
+    waits.clear()
+    monkeypatch.setattr(website, "WebDriverWait", NeverRenders)
+    monkeypatch.setattr(website, "datetime", FakeDatetime)
+    monkeypatch.setattr(website.time, "sleep", lambda s: clock.__setitem__("now", clock["now"] + timedelta(seconds=s)))
+
+    assert site.find_event_url("Mon, Nov 2nd", "9:30a - 11a", poll_times=POLLS, page_wait=10) is None
+    assert site.driver.gets == 2  # one load per poll, no extra retries
+    assert waits == [10]  # short wait for the first poll; the last uses site.wait
+    assert site.list_seen_while_polling is False
+
+
+def test_find_event_ignores_stale_cards_while_scanning(monkeypatch):
+    seen = {}
+
+    class RecordingWait:
+        def __init__(self, driver, timeout, ignored_exceptions=None, **_kwargs):
+            seen["ignored"] = ignored_exceptions
+
+        def until(self, _condition):
+            raise website.TimeoutException()
+
+    monkeypatch.setattr(website, "WebDriverWait", RecordingWait)
+    site = website.Website.__new__(website.Website)
+    site.driver = FakeListDriver([])
+
+    site._find_event("Mon, Nov 2nd", "9:30a - 11a", timeout=1)
+
+    assert website.StaleElementReferenceException in seen["ignored"]
+
+
+def test_get_with_retry_retries_one_page_load_timeout():
+    site = website.Website.__new__(website.Website)
+    site.driver = _FlakyGetDriver(failures=1)
+    site._get_with_retry("https://x/signup")
+    assert site.driver.gets == 2
+
+
+def test_get_with_retry_gives_up_after_two_timeouts():
+    site = website.Website.__new__(website.Website)
+    site.driver = _FlakyGetDriver(failures=2)
+    with pytest.raises(website.TimeoutException):
+        site._get_with_retry("https://x/signup")
+
+
+# --- round-3 review -----------------------------------------------------------
+
+
+class _StaleOnceEvent:
+    def __init__(self, href, stale_reads):
+        self._btn = FakeElement("Register", href=href)
+        self.stale_reads = stale_reads
+
+    def find_elements(self, by, selector):
+        if self.stale_reads > 0:
+            self.stale_reads -= 1
+            raise website.StaleElementReferenceException("re-rendered")
+        return [self._btn]
+
+
+def test_stale_card_after_match_is_looked_up_again(monkeypatch):
+    site, _calls = _polling_site(monkeypatch, [_StaleOnceEvent("https://x/Details/5", stale_reads=1)])
+
+    assert site.find_event_url("Mon, Nov 2nd", "9:30a - 11a", poll_times=POLLS) == "https://x/Details/5"
+
+
+def test_lookup_that_never_completes_does_not_count_as_seeing_the_list(monkeypatch):
+    site, _calls = _polling_site(
+        monkeypatch,
+        [_StaleOnceEvent("x", stale_reads=99), _StaleOnceEvent("x", stale_reads=99)],
+    )
+
+    assert site.find_event_url("Mon, Nov 2nd", "9:30a - 11a", poll_times=POLLS) is None
+    assert site.list_seen_while_polling is False
+
+
+def test_login_loads_its_page_with_retry(monkeypatch, tmp_path):
+    import json as _json
+
+    token = tmp_path / "default.json"
+    token.write_text(_json.dumps({
+        "login_url": "https://x/login", "events_url": "https://x/events",
+        "email": "a@b.c", "password": "pw",
+    }))
+    monkeypatch.setattr(website, "get_website_token_file", lambda tag: str(token))
+    site = website.Website.__new__(website.Website)
+    site.logged_in = False
+    loaded = []
+
+    def fake_get_with_retry(url, attempts=2):
+        loaded.append(url)
+        raise website.TimeoutException("login page timed out twice")
+
+    site._get_with_retry = fake_get_with_retry
+
+    with pytest.raises(website.TimeoutException):
+        site.login("default")
+    assert loaded == ["https://x/login"]
+
+
+def test_chrome_is_quit_if_setup_after_launch_fails(monkeypatch):
+    class FakeChrome:
+        quit_called = False
+
+        def __init__(self, *a, **k):
+            pass
+
+        def set_page_load_timeout(self, seconds):
+            raise RuntimeError("driver rejected timeout")
+
+        def quit(self):
+            FakeChrome.quit_called = True
+
+    monkeypatch.setattr(website.webdriver, "Chrome", FakeChrome)
+
+    with pytest.raises(RuntimeError):
+        website.Website(headless=False)
+    assert FakeChrome.quit_called

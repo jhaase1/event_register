@@ -7,6 +7,10 @@ from selenium.common.exceptions import (
     TimeoutException,
     ElementClickInterceptedException,
     NoSuchElementException,
+    WebDriverException,
+    InvalidSessionIdException,
+    StaleElementReferenceException,
+    NoSuchWindowException,
 )
 from selenium.webdriver.support.wait import WebDriverWait
 import selenium.webdriver.support.expected_conditions as EC
@@ -151,11 +155,20 @@ class Website:
         else:
             self.driver = webdriver.Chrome()
 
-        self.logged_in = False
-        self.user_tag = None
+        try:
+            # Selenium's default page-load timeout is 300 s; a hung load must
+            # not block a time-critical registration that long.
+            self.driver.set_page_load_timeout(60)
 
-        self.wait_time = wait_time
-        self.wait = WebDriverWait(self.driver, timeout=self.wait_time)
+            self.logged_in = False
+            self.user_tag = None
+
+            self.wait_time = wait_time
+            self.wait = WebDriverWait(self.driver, timeout=self.wait_time)
+        except Exception:
+            # The caller never gets this object, so it can't close Chrome.
+            self.driver.quit()
+            raise
         logger.info("Web driver initialized.")
 
     def login(self, user_tag=None):
@@ -188,7 +201,7 @@ class Website:
 
         self.events_url = website_info["events_url"]
 
-        self.driver.get(login_url)
+        self._get_with_retry(login_url)
         logger.debug(f"Navigated to login URL: {login_url}")
 
         email_field = self.wait.until(EC.element_to_be_clickable((By.NAME, "email")))
@@ -210,15 +223,31 @@ class Website:
         logger.info("Successfully logged into the website.")
         self.logged_in = True
 
-    def _go_to_events_page(self):
-        """Navigates to the events page."""
-        logger.info(f"Navigating to events page: {self.events_url}")
-        self.driver.get(self.events_url)
-        logger.debug(f"Events page loaded: {self.events_url}")
+    def _go_to_events_page(self, attempts=3, wait_time=None):
+        """Navigates to the events page, reloading if it's slow to render.
 
-        # Rendered even when there are zero matching events, so it's a reliable
-        # "the list finished its initial load" signal either way.
-        self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, EVENTS_COUNT_SPAN)))
+        The list can occasionally take longer than wait_time to appear (seen
+        right before an 8 pm opening, when the site is busiest), so a timeout
+        is retried with a fresh load before giving up. Time-critical polling
+        passes attempts=1 and a short wait_time so its own schedule decides
+        when to reload.
+        """
+        wait = self.wait if wait_time is None else WebDriverWait(self.driver, timeout=wait_time)
+        for attempt in range(1, attempts + 1):
+            logger.info(f"Navigating to events page: {self.events_url}")
+            # Rendered even when there are zero matching events, so it's a reliable
+            # "the list finished its initial load" signal either way.
+            try:
+                self.driver.get(self.events_url)
+                logger.debug(f"Events page loaded: {self.events_url}")
+                wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, EVENTS_COUNT_SPAN)))
+                return
+            except TimeoutException:
+                if attempt == attempts:
+                    raise
+                logger.warning(
+                    f"Events page didn't render (attempt {attempt}/{attempts}); reloading."
+                )
 
     def _total_events_count(self):
         try:
@@ -318,7 +347,13 @@ class Website:
                     return card
             return False
 
-        wait = self.wait if timeout is None else WebDriverWait(self.driver, timeout=timeout)
+        # Cards can re-render right after the list appears; a stale card is
+        # just a reason to scan again, not a failed lookup.
+        wait = WebDriverWait(
+            self.driver,
+            timeout=getattr(self, "wait_time", 30) if timeout is None else timeout,
+            ignored_exceptions=[StaleElementReferenceException],
+        )
         try:
             return wait.until(scan)
         except TimeoutException:
@@ -365,26 +400,70 @@ class Website:
         logger.info(f"Scanned {len(scanned)} listed event(s).")
         return scanned
 
-    def find_event_url(self, event_date: str, time_range: str, until: datetime, poll_seconds=10):
-        """Like get_event_url, but keeps reloading the list until `until`.
+    def find_event_url(self, event_date: str, time_range: str, poll_times, page_wait=10):
+        """Like get_event_url, but reloads the list at each of `poll_times`.
 
-        For speculative registrations the session may only be posted at the
-        moment registration opens, so a single lookup isn't enough. Always
-        tries at least once. Returns None if it never shows up.
+        For speculative registrations the session may only be posted the
+        moment registration opens, and popular sessions fill within seconds,
+        so the list is reloaded at specific moments around the expected
+        opening (e.g. 10 s before and 1 s after) rather than on a slow
+        interval. A time already past is polled immediately. Returns the
+        details URL as soon as the session shows up, or None after the last
+        poll.
         """
-        while True:
-            self.display_all_events()
-            event = self._find_event(event_date, time_range, timeout=2)
-            if event:
-                buttons = event.find_elements(By.CSS_SELECTOR, REGISTER_BTN)
-                href = buttons[0].get_attribute("href") if buttons else None
-                if href:
-                    logger.info(f"Speculative event posted: {href}")
-                    return href
-            if datetime.now() >= until:
-                logger.info(f"Event {event_date} {time_range} not posted by {until}.")
+        # Whether any poll got a rendered list, so callers can tell "not posted"
+        # apart from "couldn't see the list at all".
+        self.list_seen_while_polling = False
+        ordered = sorted(poll_times)
+        for index, poll_time in enumerate(ordered):
+            delay = (poll_time - datetime.now()).total_seconds()
+            if delay > 0:
+                time.sleep(delay)
+            # A short wait keeps a slow load from eating the next poll; the
+            # last poll has no next one, so it gets the full wait rather than
+            # throwing away a render that's nearly done.
+            wait = page_wait if index < len(ordered) - 1 else None
+            try:
+                href = self._poll_for_event(event_date, time_range, wait)
+            except (InvalidSessionIdException, NoSuchWindowException) as e:
+                # The browser is gone; further polls would fail instantly.
+                # Returning None leaves the row speculative so refresh retries
+                # with a fresh browser.
+                logger.error(f"Browser session lost while polling: {e}", exc_info=True)
                 return None
-            time.sleep(poll_seconds)
+            except WebDriverException as e:
+                # A slow or broken page load is just a missed poll; giving up
+                # here would forfeit the remaining polls.
+                logger.warning(f"Events list load failed while polling: {type(e).__name__}: {e}")
+                href = None
+            if href:
+                logger.info(f"Speculative event posted (poll scheduled {poll_time}): {href}")
+                return href
+            logger.info(f"Event {event_date} {time_range} not posted at {poll_time}.")
+        return None
+
+    def _poll_for_event(self, event_date, time_range, page_wait):
+        """One quick look for an event: a single page load (page_wait seconds,
+        or the default wait when None), then the full scroll only if the card
+        isn't among the first ones rendered."""
+        self._go_to_events_page(attempts=1, wait_time=page_wait)
+        for attempt in range(2):
+            try:
+                event = self._find_event(event_date, time_range, timeout=1)
+                if not event:
+                    self._display_all_events_by_scrolling()
+                    event = self._find_event(event_date, time_range, timeout=1)
+                buttons = event.find_elements(By.CSS_SELECTOR, REGISTER_BTN) if event else []
+                href = buttons[0].get_attribute("href") if buttons else None
+                break
+            except StaleElementReferenceException:
+                # The list re-rendered between matching the card and reading
+                # its link; look again rather than report a miss.
+                if attempt == 1:
+                    raise
+        # Only a completed lookup counts as having seen the list.
+        self.list_seen_while_polling = True
+        return href
 
     def _card_summary(self, event):
         """Builds a human-readable summary line from an event card's visible fields."""
@@ -508,12 +587,24 @@ class Website:
 
         return href
 
+    def _get_with_retry(self, url, attempts=2):
+        """driver.get, retried once if the page load times out (the page-load
+        timeout is capped so a hung load can't stall a registration)."""
+        for attempt in range(1, attempts + 1):
+            try:
+                self.driver.get(url)
+                return
+            except TimeoutException:
+                if attempt == attempts:
+                    raise
+                logger.warning(f"Page load timed out ({attempt}/{attempts}); retrying: {url}")
+
     def register_for_event(self, event_date: str, time_range: str, event_url: str):
         """Registers for the event."""
 
         if event_url:
             logger.info(f"Navigating to event URL: {event_url}")
-            self.driver.get(event_url)
+            self._get_with_retry(event_url)
             register_link = self.wait.until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, REGISTER_BTN))
             )
@@ -533,7 +624,7 @@ class Website:
 
         # This is a plain href, not an SPA action, so following it directly
         # sidesteps click-interception entirely instead of fighting overlays.
-        self.driver.get(signup_url)
+        self._get_with_retry(signup_url)
         logger.debug(f"Navigated to signup page: {signup_url}")
 
         def signup_outcome(driver):
