@@ -9,6 +9,7 @@ from selenium.common.exceptions import (
     NoSuchElementException,
     WebDriverException,
     InvalidSessionIdException,
+    StaleElementReferenceException,
     NoSuchWindowException,
 )
 from selenium.webdriver.support.wait import WebDriverWait
@@ -341,7 +342,13 @@ class Website:
                     return card
             return False
 
-        wait = self.wait if timeout is None else WebDriverWait(self.driver, timeout=timeout)
+        # Cards can re-render right after the list appears; a stale card is
+        # just a reason to scan again, not a failed lookup.
+        wait = WebDriverWait(
+            self.driver,
+            timeout=getattr(self, "wait_time", 30) if timeout is None else timeout,
+            ignored_exceptions=[StaleElementReferenceException],
+        )
         try:
             return wait.until(scan)
         except TimeoutException:
@@ -399,12 +406,20 @@ class Website:
         details URL as soon as the session shows up, or None after the last
         poll.
         """
-        for poll_time in sorted(poll_times):
+        # Whether any poll got a rendered list, so callers can tell "not posted"
+        # apart from "couldn't see the list at all".
+        self.list_seen_while_polling = False
+        ordered = sorted(poll_times)
+        for index, poll_time in enumerate(ordered):
             delay = (poll_time - datetime.now()).total_seconds()
             if delay > 0:
                 time.sleep(delay)
+            # A short wait keeps a slow load from eating the next poll; the
+            # last poll has no next one, so it gets the full wait rather than
+            # throwing away a render that's nearly done.
+            wait = page_wait if index < len(ordered) - 1 else None
             try:
-                href = self._poll_for_event(event_date, time_range, page_wait)
+                href = self._poll_for_event(event_date, time_range, wait)
             except (InvalidSessionIdException, NoSuchWindowException) as e:
                 # The browser is gone; further polls would fail instantly.
                 # Returning None leaves the row speculative so refresh retries
@@ -423,9 +438,11 @@ class Website:
         return None
 
     def _poll_for_event(self, event_date, time_range, page_wait):
-        """One quick look for an event: a single short page load, then the
-        full scroll only if the card isn't among the first ones rendered."""
+        """One quick look for an event: a single page load (page_wait seconds,
+        or the default wait when None), then the full scroll only if the card
+        isn't among the first ones rendered."""
         self._go_to_events_page(attempts=1, wait_time=page_wait)
+        self.list_seen_while_polling = True
         event = self._find_event(event_date, time_range, timeout=1)
         if not event:
             self._display_all_events_by_scrolling()
@@ -555,12 +572,24 @@ class Website:
 
         return href
 
+    def _get_with_retry(self, url, attempts=2):
+        """driver.get, retried once if the page load times out (the page-load
+        timeout is capped so a hung load can't stall a registration)."""
+        for attempt in range(1, attempts + 1):
+            try:
+                self.driver.get(url)
+                return
+            except TimeoutException:
+                if attempt == attempts:
+                    raise
+                logger.warning(f"Page load timed out ({attempt}/{attempts}); retrying: {url}")
+
     def register_for_event(self, event_date: str, time_range: str, event_url: str):
         """Registers for the event."""
 
         if event_url:
             logger.info(f"Navigating to event URL: {event_url}")
-            self.driver.get(event_url)
+            self._get_with_retry(event_url)
             register_link = self.wait.until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, REGISTER_BTN))
             )
@@ -580,7 +609,7 @@ class Website:
 
         # This is a plain href, not an SPA action, so following it directly
         # sidesteps click-interception entirely instead of fighting overlays.
-        self.driver.get(signup_url)
+        self._get_with_retry(signup_url)
         logger.debug(f"Navigated to signup page: {signup_url}")
 
         def signup_outcome(driver):

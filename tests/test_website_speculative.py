@@ -376,12 +376,15 @@ def test_events_page_gives_up_after_three_slow_renders():
 # --- round-1 review: quick looks, overruns, dead sessions --------------------
 
 
-def test_each_poll_is_one_short_page_load(monkeypatch):
+def test_each_poll_is_one_page_load_and_only_the_last_gets_the_full_wait(monkeypatch):
     site, calls = _polling_site(monkeypatch, [])
+    times = POLLS + [OPENS + timedelta(seconds=5)]
 
-    site.find_event_url("Mon, Nov 2nd", "9:30a - 11a", poll_times=POLLS, page_wait=7)
+    site.find_event_url("Mon, Nov 2nd", "9:30a - 11a", poll_times=times, page_wait=7)
 
-    assert calls["loads"] == [(1, 7), (1, 7)]
+    # None = the default (full) wait: nothing comes after the last poll, so a
+    # slow render is worth waiting out.
+    assert calls["loads"] == [(1, 7), (1, 7), (1, None)]
 
 
 def test_poll_skips_full_scroll_when_card_is_among_first_rendered(monkeypatch):
@@ -458,3 +461,84 @@ def test_events_page_uses_a_short_wait_when_asked(monkeypatch):
     monkeypatch.setattr(website, "WebDriverWait", RecordingWait)
     site._go_to_events_page(attempts=1, wait_time=8)
     assert used == [8]
+
+
+# --- round-2 review -----------------------------------------------------------
+
+
+def test_list_seen_flag_false_when_no_poll_rendered_the_list(monkeypatch):
+    site, _calls = _polling_site(
+        monkeypatch, [website.TimeoutException("slow"), website.TimeoutException("slow")]
+    )
+    site.find_event_url("Mon, Nov 2nd", "9:30a - 11a", poll_times=POLLS)
+    assert site.list_seen_while_polling is False
+
+
+def test_list_seen_flag_true_when_a_poll_rendered_the_list(monkeypatch):
+    site, _calls = _polling_site(monkeypatch, [website.TimeoutException("slow"), None])
+    site.find_event_url("Mon, Nov 2nd", "9:30a - 11a", poll_times=POLLS)
+    assert site.list_seen_while_polling is True
+
+
+def test_real_poll_path_treats_render_timeouts_as_misses(monkeypatch):
+    # Runs the real _poll_for_event/_go_to_events_page with a fake driver whose
+    # list never renders, rather than faking those methods.
+    site = _events_page_site(failures=0)
+    clock = {"now": OPENS - timedelta(minutes=1)}
+    waits = []
+
+    class FakeDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock["now"]
+
+    class NeverRenders:
+        def __init__(self, driver, timeout, **_kwargs):
+            waits.append(timeout)
+
+        def until(self, _condition):
+            raise website.TimeoutException("list never rendered")
+
+    site.wait = NeverRenders(None, 30)
+    waits.clear()
+    monkeypatch.setattr(website, "WebDriverWait", NeverRenders)
+    monkeypatch.setattr(website, "datetime", FakeDatetime)
+    monkeypatch.setattr(website.time, "sleep", lambda s: clock.__setitem__("now", clock["now"] + timedelta(seconds=s)))
+
+    assert site.find_event_url("Mon, Nov 2nd", "9:30a - 11a", poll_times=POLLS, page_wait=10) is None
+    assert site.driver.gets == 2  # one load per poll, no extra retries
+    assert waits == [10]  # short wait for the first poll; the last uses site.wait
+    assert site.list_seen_while_polling is False
+
+
+def test_find_event_ignores_stale_cards_while_scanning(monkeypatch):
+    seen = {}
+
+    class RecordingWait:
+        def __init__(self, driver, timeout, ignored_exceptions=None, **_kwargs):
+            seen["ignored"] = ignored_exceptions
+
+        def until(self, _condition):
+            raise website.TimeoutException()
+
+    monkeypatch.setattr(website, "WebDriverWait", RecordingWait)
+    site = website.Website.__new__(website.Website)
+    site.driver = FakeListDriver([])
+
+    site._find_event("Mon, Nov 2nd", "9:30a - 11a", timeout=1)
+
+    assert website.StaleElementReferenceException in seen["ignored"]
+
+
+def test_get_with_retry_retries_one_page_load_timeout():
+    site = website.Website.__new__(website.Website)
+    site.driver = _FlakyGetDriver(failures=1)
+    site._get_with_retry("https://x/signup")
+    assert site.driver.gets == 2
+
+
+def test_get_with_retry_gives_up_after_two_timeouts():
+    site = website.Website.__new__(website.Website)
+    site.driver = _FlakyGetDriver(failures=2)
+    with pytest.raises(website.TimeoutException):
+        site._get_with_retry("https://x/signup")

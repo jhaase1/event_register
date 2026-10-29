@@ -1386,3 +1386,47 @@ def test_scheduled_registration_not_due_when_far_off(db_path):
     db.insert_event("Later", "9a - 11a", datetime.now() + timedelta(hours=3), "default")
     db.close()
     assert main._scheduled_registration_due() is False
+
+
+# --- round-2 polling review ---------------------------------------------------
+
+
+@pytest.mark.parametrize("offsets", [[-30], [-10, -1]])
+def test_all_negative_poll_offsets_fall_back_to_default(tmp_path, offsets):
+    assert _load_config_with(tmp_path, offsets)["speculative_poll_offsets_seconds"] == [-10, 1]
+
+
+def test_zero_offset_counts_as_at_opening(tmp_path):
+    assert _load_config_with(tmp_path, [-10, 0])["speculative_poll_offsets_seconds"] == [-10, 0]
+
+
+@pytest.mark.parametrize("list_seen, expected", [(True, False), (False, True)])
+def test_not_found_result_flags_when_the_list_never_loaded(monkeypatch, list_seen, expected):
+    FakeRegisterSite.url = None
+    FakeRegisterSite.registered = []
+    FakeRegisterSite.list_seen_while_polling = list_seen
+    monkeypatch.setattr(main, "Website", FakeRegisterSite)
+    monkeypatch.setattr(main, "dwell_until", lambda *_a, **_k: None)
+    results = []
+
+    main.register_for_single_event(_speculative_info(), results=results)
+
+    assert results[0]["list_unavailable"] is expected
+    del FakeRegisterSite.list_seen_while_polling
+
+
+@pytest.mark.parametrize(
+    "list_unavailable, phrase",
+    [(False, "wasn't posted"), (True, "couldn't load the events list")],
+)
+def test_not_posted_followup_wording(monkeypatch, db_path, list_unavailable, phrase):
+    _seed_speculative(db_path, registration_time=datetime.now() + timedelta(minutes=5))
+    client = _wire_registration(
+        monkeypatch, db_path,
+        {"success": False, "speculative_not_found": True, "list_unavailable": list_unavailable, "error": "x"},
+    )
+
+    main.register_for_next_event(headless=True)
+
+    assert phrase in client.replies[0].body
+    assert "keep checking" in client.replies[0].body

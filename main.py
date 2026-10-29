@@ -89,10 +89,13 @@ def load_app_config(config_file=APP_CONFIG_FILE):
 def _valid_poll_offsets(value):
     """A non-empty list of numbers, or the default. A bad value must not break
     a registration at the critical moment, so it's replaced at load time."""
+    # At least one poll must be at or after the opening: an all-negative list
+    # would leave a missed row due again later in the same run.
     if (
         isinstance(value, list)
         and value
         and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in value)
+        and max(value) >= 0
     ):
         return value
     default = DEFAULT_APP_CONFIG["speculative_poll_offsets_seconds"]
@@ -166,6 +169,9 @@ def register_for_single_event(
                         "event": f"{event_date} {time_range}",
                         "success": False,
                         "speculative_not_found": True,
+                        # True when no poll even got a rendered list, so the
+                        # follow-up doesn't claim the session wasn't posted.
+                        "list_unavailable": not getattr(website, "list_seen_while_polling", True),
                         "error": "event not posted at the predicted time",
                         "registration_time": registration_time,
                     }
@@ -344,8 +350,14 @@ def register_for_next_event(headless=True):
     followups = [
         (
             r,
-            f"The {r['event']} session wasn't posted when I expected registration to open "
-            f"({registration_time}). I'll keep checking every run and register as soon as it shows up.",
+            (
+                f"I couldn't load the events list when registration for {r['event']} was "
+                f"expected to open ({registration_time})."
+                if r.get("list_unavailable")
+                else f"The {r['event']} session wasn't posted when I expected registration to open "
+                f"({registration_time})."
+            )
+            + " I'll keep checking every run and register as soon as it shows up.",
         )
         for r in not_posted
     ] + [
