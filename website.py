@@ -196,7 +196,7 @@ class Website:
 
         self.events_url = website_info["events_url"]
 
-        self.driver.get(login_url)
+        self._get_with_retry(login_url)
         logger.debug(f"Navigated to login URL: {login_url}")
 
         email_field = self.wait.until(EC.element_to_be_clickable((By.NAME, "email")))
@@ -442,13 +442,23 @@ class Website:
         or the default wait when None), then the full scroll only if the card
         isn't among the first ones rendered."""
         self._go_to_events_page(attempts=1, wait_time=page_wait)
+        for attempt in range(2):
+            try:
+                event = self._find_event(event_date, time_range, timeout=1)
+                if not event:
+                    self._display_all_events_by_scrolling()
+                    event = self._find_event(event_date, time_range, timeout=1)
+                buttons = event.find_elements(By.CSS_SELECTOR, REGISTER_BTN) if event else []
+                href = buttons[0].get_attribute("href") if buttons else None
+                break
+            except StaleElementReferenceException:
+                # The list re-rendered between matching the card and reading
+                # its link; look again rather than report a miss.
+                if attempt == 1:
+                    raise
+        # Only a completed lookup counts as having seen the list.
         self.list_seen_while_polling = True
-        event = self._find_event(event_date, time_range, timeout=1)
-        if not event:
-            self._display_all_events_by_scrolling()
-            event = self._find_event(event_date, time_range, timeout=1)
-        buttons = event.find_elements(By.CSS_SELECTOR, REGISTER_BTN) if event else []
-        return buttons[0].get_attribute("href") if buttons else None
+        return href
 
     def _card_summary(self, event):
         """Builds a human-readable summary line from an event card's visible fields."""

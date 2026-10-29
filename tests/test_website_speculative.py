@@ -542,3 +542,58 @@ def test_get_with_retry_gives_up_after_two_timeouts():
     site.driver = _FlakyGetDriver(failures=2)
     with pytest.raises(website.TimeoutException):
         site._get_with_retry("https://x/signup")
+
+
+# --- round-3 review -----------------------------------------------------------
+
+
+class _StaleOnceEvent:
+    def __init__(self, href, stale_reads):
+        self._btn = FakeElement("Register", href=href)
+        self.stale_reads = stale_reads
+
+    def find_elements(self, by, selector):
+        if self.stale_reads > 0:
+            self.stale_reads -= 1
+            raise website.StaleElementReferenceException("re-rendered")
+        return [self._btn]
+
+
+def test_stale_card_after_match_is_looked_up_again(monkeypatch):
+    site, _calls = _polling_site(monkeypatch, [_StaleOnceEvent("https://x/Details/5", stale_reads=1)])
+
+    assert site.find_event_url("Mon, Nov 2nd", "9:30a - 11a", poll_times=POLLS) == "https://x/Details/5"
+
+
+def test_lookup_that_never_completes_does_not_count_as_seeing_the_list(monkeypatch):
+    site, _calls = _polling_site(
+        monkeypatch,
+        [_StaleOnceEvent("x", stale_reads=99), _StaleOnceEvent("x", stale_reads=99)],
+    )
+
+    assert site.find_event_url("Mon, Nov 2nd", "9:30a - 11a", poll_times=POLLS) is None
+    assert site.list_seen_while_polling is False
+
+
+def test_login_loads_its_page_with_retry(monkeypatch, tmp_path):
+    import json as _json
+
+    token = tmp_path / "default.json"
+    token.write_text(_json.dumps({
+        "login_url": "https://x/login", "events_url": "https://x/events",
+        "email": "a@b.c", "password": "pw",
+    }))
+    monkeypatch.setattr(website, "get_website_token_file", lambda tag: str(token))
+    site = website.Website.__new__(website.Website)
+    site.logged_in = False
+    loaded = []
+
+    def fake_get_with_retry(url, attempts=2):
+        loaded.append(url)
+        raise website.TimeoutException("login page timed out twice")
+
+    site._get_with_retry = fake_get_with_retry
+
+    with pytest.raises(website.TimeoutException):
+        site.login("default")
+    assert loaded == ["https://x/login"]

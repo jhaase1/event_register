@@ -3,6 +3,7 @@ from tabulate import tabulate
 import json
 from events import Events
 from website import Website, SkillLevelIneligible, EventNotFound
+from selenium.common.exceptions import WebDriverException
 from dwell import dwell_until, is_within_offset
 from email_client import EmailClient
 from user_intent import extract_user_intent
@@ -148,8 +149,28 @@ def register_for_single_event(
 
     website = None
     try:
-        website = Website(headless=headless)
-        website.login(user_tag=user_tag)
+        try:
+            website = Website(headless=headless)
+            website.login(user_tag=user_tag)
+        except WebDriverException as e:
+            if status != "speculative":
+                raise
+            # A slow site at the opening (as on Oct 26) mustn't end a
+            # speculative row for good: report it like a list we couldn't
+            # see, so the row goes back to speculative and refresh retries.
+            logger.warning(f"Browser start or login failed for speculative row (user '{user_tag}'): {e}")
+            _record_result(
+                {
+                    "user_tag": user_tag,
+                    "event": f"{event_date} {time_range}",
+                    "success": False,
+                    "speculative_not_found": True,
+                    "list_unavailable": True,
+                    "error": f"login failed: {e}",
+                    "registration_time": registration_time,
+                }
+            )
+            return
         if status == "speculative":
             # The session may only get posted the moment registration opens
             # and can fill within seconds, so look for it at configured

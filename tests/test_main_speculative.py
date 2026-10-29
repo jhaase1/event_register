@@ -1430,3 +1430,50 @@ def test_not_posted_followup_wording(monkeypatch, db_path, list_unavailable, phr
 
     assert phrase in client.replies[0].body
     assert "keep checking" in client.replies[0].body
+
+
+# --- round-3 polling review: login failures ------------------------------------
+
+
+class _LoginTimesOutSite(FakeRegisterSite):
+    def login(self, user_tag=None):
+        raise main.WebDriverException("login page timed out")
+
+
+def test_speculative_login_timeout_leaves_row_retryable(monkeypatch):
+    monkeypatch.setattr(main, "Website", _LoginTimesOutSite)
+    results = []
+
+    main.register_for_single_event(_speculative_info(), results=results)
+
+    assert results[0]["success"] is False
+    assert results[0]["speculative_not_found"] is True
+    assert results[0]["list_unavailable"] is True
+
+
+def test_confirmed_login_timeout_is_still_a_real_failure(monkeypatch):
+    monkeypatch.setattr(main, "Website", _LoginTimesOutSite)
+    info = dict(_speculative_info(), status="confirmed")
+    results = []
+
+    main.register_for_single_event(info, results=results)
+
+    assert results[0]["success"] is False
+    assert not results[0].get("speculative_not_found")
+
+
+def test_speculative_login_timeout_end_to_end_keeps_row_speculative(monkeypatch, db_path):
+    _seed_speculative(db_path, registration_time=datetime.now() + timedelta(minutes=5))
+    client = FakeEmailClient()
+    monkeypatch.setattr(main, "EmailClient", lambda: client)
+    monkeypatch.setattr(main, "is_within_offset", lambda *_a, **_k: True)
+    monkeypatch.setattr(main, "dwell_until", lambda *_a, **_k: None)
+    monkeypatch.setattr(main, "Website", _LoginTimesOutSite)
+
+    main.register_for_next_event(headless=True)
+
+    db = _open(db_path)
+    assert len(db.get_speculative_events()) == 1
+    db.close()
+    assert client.notifications == []
+    assert "couldn't load the events list" in client.replies[0].body
