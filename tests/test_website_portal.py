@@ -195,6 +195,177 @@ def test_picks_the_series_that_actually_has_the_date():
     assert "BOTH" in url
 
 
+def test_prefers_the_series_the_user_can_register_for_in_a_shared_slot():
+    series = [
+        Series(1, [row(D1, "11a - 1p")], restriction="Advanced", details_code="ADVANCED"),
+        Series(2, [row(D1, "11a - 1p")], restriction="Intermediate", details_code="INTERMEDIATE"),
+    ]
+    site, _fake = make_site(series)
+
+    when, summary = site.determine_access_date(req(D1), "11a - 1p")
+
+    assert when is not None
+    assert "Skill Level Restriction: Intermediate" in summary
+    assert "INTERMEDIATE" in site.last_details_url
+
+
+def test_prefers_a_series_with_room_over_a_full_one_in_a_shared_slot():
+    series = [
+        Series(1, [row(D1, "11a - 1p", state="full")], details_code="FULLONE"),
+        Series(2, [row(D1, "11a - 1p")], details_code="ROOMY"),
+    ]
+    site, _fake = make_site(series)
+
+    assert "ROOMY" in site.get_event_url(req(D1), "11a - 1p")
+
+
+def test_falls_back_to_the_ineligible_series_when_none_fits():
+    series = [
+        Series(1, [row(D1, "11a - 1p")], restriction="Advanced", details_code="ADV1"),
+        Series(2, [row(D1, "11a - 1p")], restriction="Beginner", details_code="BEG2"),
+    ]
+    site, fake = make_site(series)
+
+    with pytest.raises(website.SkillLevelIneligible) as error:
+        site.determine_access_date(req(D1), "11a - 1p")
+
+    assert "Advanced" in str(error.value)  # the first match, re-opened
+    assert "ADV1" in fake.current_url
+
+
+def test_eligible_series_rendered_only_after_scrolling_is_preferred():
+    series = [
+        Series(1, [row(D1, "11a - 1p")], restriction="Advanced", details_code="ADVANCED"),
+        Series(2, [row(D1, "11a - 1p")], restriction="Intermediate", details_code="INTERMEDIATE"),
+    ]
+    site, fake = make_site(series)
+    fake.lazy_cards = 1  # only the Advanced card renders until scrolled
+
+    assert "INTERMEDIATE" in site.get_event_url(req(D1), "11a - 1p")
+
+
+def test_right_series_rendered_only_after_scrolling_is_found():
+    # The rendered card is a same-slot series that doesn't list D2.
+    series = [
+        Series(1, [row(D1, "11a - 1p")], details_code="ONLYD1"),
+        Series(2, [row(D1, "11a - 1p"), row(D2, "11a - 1p", state="not_open")], details_code="BOTH"),
+    ]
+    site, fake = make_site(series)
+    fake.lazy_cards = 1
+
+    assert "BOTH" in site.get_event_url(req(D2), "11a - 1p")
+
+
+def test_fully_rendered_list_is_not_reloaded_after_the_last_candidate():
+    series = [Series(1, [row(D1, "11a - 1p")], details_code="ONLYD1")]
+    site, fake = make_site(series)
+
+    with pytest.raises(website.EventNotFound):
+        site.determine_access_date(req(D2), "11a - 1p")
+
+    assert fake.gets.count(fake.events_url) == 1
+
+
+@pytest.mark.parametrize("order", ["full_first", "restricted_first"])
+def test_full_eligible_series_beats_a_restricted_one_when_none_fits(order):
+    full = Series(1, [row(D1, "11a - 1p", state="full")], restriction="Intermediate", details_code="FULLINT")
+    restricted = Series(2, [row(D1, "11a - 1p")], restriction="Advanced", details_code="ADVANCED")
+    site, _fake = make_site([full, restricted] if order == "full_first" else [restricted, full])
+
+    with pytest.raises(website.EventFull):
+        site.determine_access_date(req(D1), "11a - 1p")
+
+
+def test_a_card_rendered_only_after_scrolling_is_still_opened():
+    # The match is the second candidate, reached after reloading the list,
+    # and the reloaded list only renders the first card until it's scrolled.
+    series = [
+        Series(1, [row(D1, "11a - 1p")], details_code="ONLYD1"),
+        Series(2, [row(D1, "11a - 1p"), row(D2, "11a - 1p", state="not_open")], details_code="BOTH"),
+    ]
+    site, fake = make_site(series)
+    real_get = fake.get
+
+    def get(url):
+        real_get(url)
+        if fake.gets.count(fake.events_url) > 1:
+            fake.lazy_cards = 1
+
+    fake.get = get
+
+    assert "BOTH" in site.get_event_url(req(D2), "11a - 1p")
+
+
+def test_a_card_missing_from_the_reloaded_list_is_skipped_not_a_timeout():
+    series = [
+        Series(1, [row(D1, "11a - 1p")], details_code="ONLYD1"),
+        Series(2, [row(D1, "11a - 1p"), row(D2, "11a - 1p", state="not_open")], details_code="GONE"),
+    ]
+    site, fake = make_site(series)
+    real_get = fake.get
+
+    def get(url):
+        real_get(url)
+        if fake.gets.count(fake.events_url) > 1:
+            fake.series.pop("2", None)  # withdrawn between list loads
+
+    fake.get = get
+
+    with pytest.raises(website.EventNotFound) as error:
+        site.determine_access_date(req(D2), "11a - 1p")
+
+    assert "1 not on the reloaded list" in str(error.value)
+
+
+def test_details_wait_requires_date_rows_not_just_the_list_container():
+    site, fake = make_site()
+    fake.get(_details_url("SERIES101"))
+    original = fake._details_page
+
+    def rows_not_rendered(s):
+        children = original(s)
+        for child in children:
+            if child.testid == "events-details-dates-list":
+                child.children = []
+        return children
+
+    fake._details_page = rows_not_rendered
+
+    with pytest.raises(website.TimeoutException) as error:
+        site._wait_for_details_page()
+
+    assert "dates" in str(error.value)
+
+
+def test_details_wait_tolerates_a_header_without_button_or_message():
+    site, fake = make_site()
+    fake.get(_details_url("SERIES101"))
+    original = fake._details_page
+
+    def without_button(s):
+        return [c for c in original(s) if "register-btn" not in (c.testid or "")]
+
+    fake._details_page = without_button
+
+    site._wait_for_details_page()  # no exception: the label check reports it
+
+
+def test_polling_passes_its_short_wait_to_the_details_page(monkeypatch):
+    site, _fake = make_site()
+    waits = []
+    original = site._wait_for_details_page
+
+    def recording(timeout=None):
+        waits.append(timeout)
+        original(timeout)
+
+    monkeypatch.setattr(site, "_wait_for_details_page", recording)
+
+    site._find_occurrence(req(D1), "11a - 1p", list_wait=2, attempts=1)
+
+    assert waits == [2]
+
+
 # --- get_event_url ----------------------------------------------------------
 
 
@@ -279,9 +450,10 @@ def test_register_when_already_registered_does_nothing():
     assert not any("SignUpToEvent" in url for url in fake.gets)
 
 
-def test_register_selects_the_requested_date_when_header_shows_another():
+def test_register_selects_the_requested_date_when_a_row_click_selects_it():
     series = standard_series()
     series[0].rows[1].state = "open"  # D2 is open too; header shows D1 by default
+    series[0].row_click_selects = True  # opt-in: not confirmed on the live site
     site, _fake = make_site(series)
 
     site.register_for_event(req(D2), "11a - 1p", _details_url("SERIES101"))
@@ -290,15 +462,303 @@ def test_register_selects_the_requested_date_when_header_shows_another():
     assert series[0].rows[0].registered is False
 
 
-def test_register_refuses_a_date_not_open_yet():
+def test_register_stops_when_a_row_click_does_not_select_the_date():
     series = standard_series()
-    series[0].selected = 1
-    site, _fake = make_site(series)
+    series[0].rows[1].state = "open"
+    site, fake = make_site(series)
 
     with pytest.raises(website.RegistrationError) as error:
         site.register_for_event(req(D2), "11a - 1p", _details_url("SERIES101"))
 
+    assert "selecting that date didn't work" in str(error.value)
+    assert not isinstance(error.value, website.RegistrationUnverified)
+    assert not any("SignUpToEvent" in url for url in fake.gets)  # Register never clicked
+    assert all(not r.registered for r in series[0].rows)
+
+
+def test_header_resets_to_its_default_date_on_every_load():
+    series = standard_series()
+    series[0].row_click_selects = True
+    site, fake = make_site(series)
+    fake.get(_details_url("SERIES101"))
+    site._select_date(req(D2), "11a - 1p")
+    assert site._header_month_day() == (D2.month, D2.day)
+
+    fake.get(_details_url("SERIES101"))
+
+    assert site._header_month_day() == (D1.month, D1.day)
+
+
+def _header_resets_after_signup(finalize_navigates):
+    series = standard_series()
+    series[0].rows[1].state = "open"
+    series[0].default_row = 1  # the page opens on D2...
+    series[0].finalize_navigates = finalize_navigates
+    site, fake = make_site(series)
+    real_get = fake.get
+
+    def get(url):
+        real_get(url)
+        if "Details" in url and any("SignUpToEvent" in u for u in fake.gets):
+            series[0].selected = 0  # ...but shows D1 after the reload
+
+    fake.get = get
+    return site, series
+
+
+def test_unverified_message_says_the_signup_page_was_left():
+    site, _series = _header_resets_after_signup(finalize_navigates=True)
+
+    with pytest.raises(website.RegistrationUnverified) as error:
+        site.register_for_event(req(D2), "11a - 1p", _details_url("SERIES101"))
+
+    assert "the browser left the signup page" in str(error.value)
+
+
+def test_unfinished_signup_that_cannot_be_checked_is_a_plain_failure():
+    site, _series = _header_resets_after_signup(finalize_navigates=False)
+
+    with pytest.raises(website.RegistrationError) as error:
+        site.register_for_event(req(D2), "11a - 1p", _details_url("SERIES101"))
+
+    assert not isinstance(error.value, website.RegistrationUnverified)
+    assert "still showed Finalize Registration after 1 s" in str(error.value)
+
+
+def test_post_finalize_wait_is_capped(monkeypatch):
+    series = standard_series()
+    site, _fake = make_site(series)
+    site.wait_time = 30
+    waits = []
+    real_wait = site._wait
+
+    def recording(condition, what, timeout=None):
+        if what == "the signup to complete":
+            waits.append(timeout)
+            raise website.TimeoutException("still on signup")
+        return real_wait(condition, what, timeout=timeout)
+
+    monkeypatch.setattr(site, "_wait", recording)
+
+    site.register_for_event(req(D1), "11a - 1p", _details_url("SERIES101"))
+
+    assert waits == [website.FINALIZE_SETTLE_SECONDS]
+
+
+def test_verification_that_cannot_reselect_the_date_is_unverified_not_failed():
+    series = standard_series()
+    series[0].rows[1].state = "open"
+    series[0].default_row = 1  # the page opens on D2...
+    series[0].finalize_navigates = True
+    site, fake = make_site(series)
+    real_get = fake.get
+
+    def get(url):
+        real_get(url)
+        if "Details" in url and any("SignUpToEvent" in u for u in fake.gets):
+            series[0].selected = 0  # ...but shows D1 after the reload
+
+    fake.get = get
+
+    with pytest.raises(website.RegistrationUnverified) as error:
+        site.register_for_event(req(D2), "11a - 1p", _details_url("SERIES101"))
+
+    assert series[0].rows[1].registered is True
+    message = str(error.value)
+    assert "Finalize Registration was clicked for" in message
+    assert "couldn't be checked" in message and f"{D1:%b} {D1.day}" in message
+
+
+@pytest.mark.parametrize("navigates", [False, True])
+def test_finalize_is_verified_by_reload_whether_or_not_the_site_leaves_the_signup_page(navigates):
+    series = standard_series()
+    series[0].finalize_navigates = navigates
+    site, fake = make_site(series)
+
+    site.register_for_event(req(D1), "11a - 1p", _details_url("SERIES101"))
+
+    assert series[0].rows[0].registered is True
+    assert fake.gets[-1] == _details_url("SERIES101")
+
+
+def test_register_refuses_a_date_not_open_yet():
+    series = standard_series()
+    series[0].default_row = 1
+    site, fake = make_site(series)
+
+    with pytest.raises(website.RegistrationNotOpen) as error:
+        site.register_for_event(req(D2), "11a - 1p", _details_url("SERIES101"))
+
     assert "may not be open" in str(error.value)
+    assert error.value.opens_in == timedelta(days=4, hours=23)
+    assert fake.gets == [_details_url("SERIES101")]  # far off: no reloading
+
+
+class _FakeTime:
+    """Stands in for website.py's `time` module only (WebDriverWait keeps the real one)."""
+
+    def __init__(self):
+        self.now = 1000.0
+        self.sleeps = []
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+    def time(self):
+        import time
+        return time.time()
+
+
+def _opening_soon_site(monkeypatch, opens_in_text, opens_after_loads):
+    series = standard_series()
+    series[0].default_row = 1
+    target = series[0].rows[1]
+    target.opens_in = opens_in_text
+    target.opens_after_loads = opens_after_loads
+    clock = _FakeTime()
+    monkeypatch.setattr(website, "time", clock)
+    site, fake = make_site(series)
+    return site, fake, series, clock.sleeps
+
+
+def test_register_reloads_until_a_date_opening_shortly_opens(monkeypatch):
+    # The first load counts too: opens on the 3rd load, i.e. after 2 reloads.
+    site, _fake, series, sleeps = _opening_soon_site(
+        monkeypatch, "Single date registration opens in 1 min and 30 sec", opens_after_loads=3
+    )
+
+    site.register_for_event(req(D2), "11a - 1p", _details_url("SERIES101"))
+
+    assert series[0].rows[1].registered is True
+    assert sleeps == [website.OPENING_RELOAD_SECONDS] * 2
+
+
+def test_register_gives_up_on_a_date_that_does_not_open_in_time(monkeypatch):
+    site, _fake, series, sleeps = _opening_soon_site(
+        monkeypatch, "Single date registration opens in 45 sec", opens_after_loads=1000
+    )
+
+    with pytest.raises(website.RegistrationNotOpen) as error:
+        site.register_for_event(req(D2), "11a - 1p", _details_url("SERIES101"))
+
+    assert error.value.opens_in == timedelta(seconds=45)
+    assert sum(sleeps) == website.OPENING_WAIT.total_seconds()
+    assert not series[0].rows[1].registered
+
+
+def test_failed_reloads_while_waiting_for_the_opening_are_retried(monkeypatch):
+    site, fake, series, _sleeps = _opening_soon_site(
+        monkeypatch, "Single date registration opens in 30 sec", opens_after_loads=4
+    )
+    real_get = fake.get
+    loads = {"n": 0}
+
+    def flaky_get(url):
+        if "Details" in url:
+            loads["n"] += 1
+            if loads["n"] in (2, 3):
+                raise website.WebDriverException("net::ERR_CONNECTION_RESET")
+        real_get(url)
+
+    fake.get = flaky_get
+
+    site.register_for_event(req(D2), "11a - 1p", _details_url("SERIES101"))
+
+    assert series[0].rows[1].registered is True
+
+
+def test_reloads_that_keep_failing_end_in_not_open_not_a_timeout(monkeypatch):
+    site, fake, series, sleeps = _opening_soon_site(
+        monkeypatch, "Single date registration opens in 30 sec", opens_after_loads=1000
+    )
+    real_get = fake.get
+
+    def get(url):
+        if "Details" in url and fake.gets:
+            raise website.TimeoutException("page load timed out")
+        real_get(url)
+
+    fake.get = get
+
+    with pytest.raises(website.RegistrationNotOpen):
+        site.register_for_event(req(D2), "11a - 1p", _details_url("SERIES101"))
+
+    assert sum(sleeps) == website.OPENING_WAIT.total_seconds()
+
+
+def test_reload_pause_follows_a_countdown_shorter_than_the_interval(monkeypatch):
+    site, _fake, series, sleeps = _opening_soon_site(
+        monkeypatch, "Single date registration opens in 2 sec", opens_after_loads=2
+    )
+
+    site.register_for_event(req(D2), "11a - 1p", _details_url("SERIES101"))
+
+    assert sleeps == [2]
+
+
+def test_zero_countdown_counts_as_a_real_countdown(monkeypatch):
+    site, fake, series, sleeps = _opening_soon_site(
+        monkeypatch, "Single date registration opens in 30 sec", opens_after_loads=3
+    )
+    real_get = fake.get
+
+    def get(url):
+        real_get(url)
+        if sum("Details" in u for u in fake.gets) >= 2:  # from the first reload on
+            series[0].rows[1].opens_in = "Single date registration opens in 0 sec"
+
+    fake.get = get
+
+    site.register_for_event(req(D2), "11a - 1p", _details_url("SERIES101"))
+
+    assert series[0].rows[1].registered is True
+    assert sleeps == [5, 1]  # the second pause follows the 0 s countdown
+
+
+def test_register_does_not_wait_for_a_countdown_beyond_a_few_minutes(monkeypatch):
+    site, _fake, _series, sleeps = _opening_soon_site(
+        monkeypatch, "Single date registration opens in 10 min", opens_after_loads=2
+    )
+
+    with pytest.raises(website.RegistrationNotOpen):
+        site.register_for_event(req(D2), "11a - 1p", _details_url("SERIES101"))
+
+    assert sleeps == []
+
+
+def test_register_falls_back_to_js_click_when_the_click_is_intercepted():
+    series = standard_series()
+    series[0].register_click_error = website.ElementClickInterceptedException("overlay")
+    site, _fake = make_site(series)
+
+    site.register_for_event(req(D1), "11a - 1p", _details_url("SERIES101"))
+
+    assert series[0].rows[0].registered is True
+
+
+def test_register_does_not_hide_other_click_errors_behind_a_js_click():
+    series = standard_series()
+    series[0].register_click_error = website.WebDriverException("session crashed")
+    site, fake = make_site(series)
+
+    with pytest.raises(website.WebDriverException):
+        site.register_for_event(req(D1), "11a - 1p", _details_url("SERIES101"))
+
+    assert not any("SignUpToEvent" in url for url in fake.gets)
+
+
+def test_not_eligible_text_on_the_details_page_does_not_abort_the_signup():
+    series = standard_series()
+    series[0].description = "Players not eligible for the ladder may still drop in."
+    site, _fake = make_site(series)
+
+    site.register_for_event(req(D1), "11a - 1p", _details_url("SERIES101"))
+
+    assert series[0].rows[0].registered is True
 
 
 def test_register_checks_skill_restriction_before_clicking():
@@ -611,3 +1071,110 @@ def test_login_loads_its_page_with_retry(monkeypatch, tmp_path):
     with pytest.raises(website.TimeoutException):
         site.login("default")
     assert loaded == ["https://x/login"]
+
+
+# --- round 3: button labels, signup page timing, eligibility text -------------
+
+
+def test_open_date_without_a_register_button_is_a_failure_not_not_open():
+    series = standard_series()
+    site, fake = make_site(series)
+    original = fake._details_page
+
+    def without_button(s):
+        return [c for c in original(s) if "register-btn" not in (c.testid or "")]
+
+    fake._details_page = without_button
+
+    with pytest.raises(website.RegistrationError) as error:
+        site.register_for_event(req(D1), "11a - 1p", _details_url("SERIES101"))
+
+    assert not isinstance(error.value, website.RegistrationNotOpen)
+    assert "no registration countdown" in str(error.value)
+
+
+def test_unrecognized_label_after_finalize_is_unverified():
+    series = standard_series()
+    plain_label = series[0].row_label
+    series[0].row_label = lambda r: "Manage" if r.registered else plain_label(r)
+    site, _fake = make_site(series)
+
+    with pytest.raises(website.RegistrationUnverified) as error:
+        site.register_for_event(req(D1), "11a - 1p", _details_url("SERIES101"))
+
+    assert "'manage'" in str(error.value)
+
+
+def test_register_label_after_finalize_is_a_definite_failure():
+    series = standard_series()
+    series[0].on_register = "nothing"
+    site, _fake = make_site(series)
+
+    with pytest.raises(website.RegistrationError) as error:
+        site.register_for_event(req(D1), "11a - 1p", _details_url("SERIES101"))
+
+    assert not isinstance(error.value, website.RegistrationUnverified)
+
+
+def test_finalize_waits_for_the_signup_date_rendering_after_the_button():
+    series = standard_series()
+    series[0].signup_date_delay_renders = 6
+    site, _fake = make_site(series)
+
+    site.register_for_event(req(D1), "11a - 1p", _details_url("SERIES101"))
+
+    assert series[0].rows[0].registered is True
+
+
+def test_finalize_spinner_hiding_the_button_is_not_taken_as_done():
+    # The button vanishes for a second while the request runs; leaving the
+    # page then would abandon the registration.
+    series = standard_series()
+    series[0].finalize_spinner_seconds = 1.0
+    series[0].finalize_navigates = True
+    site, _fake = make_site(series)
+    site.wait_time = 5
+
+    site.register_for_event(req(D1), "11a - 1p", _details_url("SERIES101"))
+
+    assert series[0].rows[0].registered is True
+
+
+def test_not_eligible_inside_a_script_does_not_block_the_signup():
+    series = standard_series()
+    series[0].signup_script_text = "var messages = {ineligible: 'You are not eligible'};"
+    site, _fake = make_site(series)
+
+    site.register_for_event(req(D1), "11a - 1p", _details_url("SERIES101"))
+
+    assert series[0].rows[0].registered is True
+
+
+def test_hidden_not_eligible_text_does_not_block_the_signup():
+    series = standard_series()
+    site, fake = make_site(series)
+    original = fake._signup_page
+
+    def with_hidden_message(s):
+        return original(s) + [website_hidden_message()]
+
+    fake._signup_page = with_hidden_message
+
+    site.register_for_event(req(D1), "11a - 1p", _details_url("SERIES101"))
+
+    assert series[0].rows[0].registered is True
+
+
+def website_hidden_message():
+    from fake_portal import El
+    return El(text="You are not eligible to register for this event.", displayed=False)
+
+
+def test_enabled_finalize_button_wins_over_stray_not_eligible_text():
+    series = standard_series()
+    site, fake = make_site(series)
+    fake.ineligible = True  # visible text on every page
+
+    site.register_for_event(req(D1), "11a - 1p", _details_url("SERIES101"))
+
+    assert series[0].rows[0].registered is True

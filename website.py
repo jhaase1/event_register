@@ -6,6 +6,7 @@ from selenium.webdriver.common.action_chains import ActionChains
 from selenium.common.exceptions import (
     TimeoutException,
     ElementClickInterceptedException,
+    ElementNotInteractableException,
     NoSuchElementException,
     WebDriverException,
     InvalidSessionIdException,
@@ -124,10 +125,37 @@ OPEN_LABELS = (LABEL_REGISTER, LABEL_WAITLIST) + REGISTERED_LABELS
 SIGNUP_DATE = _testid("event-signup-header-date")      # "Thu, Nov 12, 2026"
 SIGNUP_SUBMIT_BTN = _testid("event-signup-submit-btn")  # "Finalize Registration"
 CONTINUE_BUTTON = "button[data-testid='Continue']"
+# Own text only (text(), not the whole subtree), and never script or style
+# contents, which can mention eligibility without the page saying so.
 INELIGIBLE_XPATH = (
-    "//*[contains(translate(., "
+    "//*[not(self::script) and not(self::style)][contains(translate(text(), "
     "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'not eligible')]"
 )
+
+# Clicks that a JS click can get past: an overlay covering the button, or a
+# button scrolled out of reach. Anything else (a dead session, a stale page)
+# would fail a JS click too, or hide a real problem behind it.
+JS_CLICK_FALLBACK_ERRORS = (ElementClickInterceptedException, ElementNotInteractableException)
+
+# When a date's countdown is this close at registration time (the scheduler
+# clicks a few seconds after the expected opening, and the site's clock may
+# differ a little), reload until Register appears rather than give up.
+OPENING_SOON = timedelta(minutes=3)
+OPENING_WAIT = timedelta(seconds=90)
+OPENING_RELOAD_SECONDS = 5
+
+# How long a loaded details page gets to show its Register button or signup
+# message; the header renders before them, so reading it too early would see
+# no button at all.
+DETAILS_HYDRATE_SECONDS = 5
+
+# How long the signup page gets to finish after Finalize Registration. The
+# details page reload decides the outcome, so this only needs to be long
+# enough for the request to go out.
+FINALIZE_SETTLE_SECONDS = 10
+# The Finalize button can vanish behind a spinner while the request is still
+# going; only this long without it (still on the signup page) counts as done.
+SUBMIT_GONE_GRACE_SECONDS = 2
 
 FAILURE_DIR = os.path.join("logs", "failures")
 FAILURE_RETENTION_DAYS = 14
@@ -272,6 +300,24 @@ class EventFull(Exception):
 
 class RegistrationError(RuntimeError):
     """Raised when the registration step didn't go through or couldn't be confirmed."""
+
+
+class RegistrationNotOpen(RegistrationError):
+    """Raised when the requested date has no Register button because
+    registration hasn't opened (yet). opens_in is the site's countdown, if any."""
+
+    def __init__(self, message, opens_in=None):
+        super().__init__(message)
+        self.opens_in = opens_in
+
+
+class RegistrationUnverified(RegistrationError):
+    """Raised when Finalize Registration was clicked but the details page
+    couldn't be brought back to the requested date to check the result.
+
+    The registration most likely went through, so callers shouldn't report
+    it as a plain failure.
+    """
 
 
 class Website:
@@ -589,25 +635,50 @@ class Website:
 
     # --- series details page --------------------------------------------------
 
-    def _open_details_from_card(self, card_id):
+    def _open_details_from_card(self, card_id, wait_time=None):
         """Opens a series' details page via its 'VIEW UPCOMING DATES' button
-        (which only navigates; it never registers). Returns the page URL."""
-        button = self._wait(
-            EC.presence_of_element_located((By.CSS_SELECTOR, LIST_CARD_UPCOMING(card_id))),
-            f"the 'view upcoming dates' button of card {card_id}",
-            timeout=5,
-        )
+        (which only navigates; it never registers). Returns the page URL, or
+        None if the card isn't on the list."""
+        selector = LIST_CARD_UPCOMING(card_id)
+        if not self.driver.find_elements(By.CSS_SELECTOR, selector):
+            # A freshly loaded list only renders its first cards until it's
+            # scrolled, so a card found on an earlier load may be missing now.
+            self._display_all_events_by_scrolling()
+        try:
+            button = self._wait(
+                EC.presence_of_element_located((By.CSS_SELECTOR, selector)),
+                f"the 'view upcoming dates' button of card {card_id}",
+                timeout=min(5, getattr(self, "wait_time", 30)),
+            )
+        except TimeoutException as e:
+            logger.warning(f"Card {card_id} isn't on the reloaded list; skipping it. {e}")
+            return None
         self.driver.execute_script("arguments[0].click();", button)
-        self._wait_for_details_page()
+        self._wait_for_details_page(timeout=wait_time)
         logger.debug(f"Opened series details: {self.driver.current_url}")
         return self.driver.current_url
 
     def _wait_for_details_page(self, timeout=None):
+        # The dates list container renders before its rows, and the header's
+        # Register button or signup message after the header itself; reading
+        # either too early would see an empty series or no button.
         self._wait(
-            EC.presence_of_element_located((By.CSS_SELECTOR, DETAILS_DATES_LIST)),
-            "the event details page",
+            lambda _driver: self._details_row_indexes(),
+            "the event details page's dates",
             timeout=timeout,
         )
+        hydrate = min(DETAILS_HYDRATE_SECONDS, getattr(self, "wait_time", 30) if timeout is None else timeout)
+        try:
+            self._wait(
+                EC.presence_of_element_located(
+                    (By.CSS_SELECTOR, f"{DETAILS_REGISTER_BTN}, {DETAILS_SIGNUP_MESSAGE}")
+                ),
+                "the details page's Register button or signup message",
+                timeout=hydrate,
+            )
+        except TimeoutException as e:
+            # Not fatal: the label check that follows reports what it sees.
+            logger.debug(str(e))
 
     def _details_row_indexes(self):
         indexes = []
@@ -662,26 +733,105 @@ class Website:
         if not candidates:
             self._display_all_events_by_scrolling()
             candidates = self._series_candidates(event_date, time_range)
+        # Read now, while the list is loaded: if every card was rendered,
+        # there's nothing more to look at once these candidates are checked.
+        fully_rendered = self._list_fully_rendered()
 
         query_md = _parse_month_day(event_date or "")
         query_time = _parse_time_range(time_range or "")
-        for index, card in enumerate(candidates):
-            if index:
+        # Several series can share a slot (e.g. an Advanced and an
+        # Intermediate session at the same time), so a match the user can't
+        # register for is only used if no other series fits.
+        eligible_fallback = None  # passes the skill check but is full
+        any_fallback = None
+        visited = set()
+        skipped = 0
+        on_list = True
+        batch = candidates
+        while True:
+            for card in batch:
+                if not on_list:
+                    self._go_to_events_page(attempts=attempts, wait_time=list_wait)
+                visited.add(card["card_id"])
+                url = self._open_details_from_card(card["card_id"], wait_time=list_wait)
+                on_list = url is None
+                if url is None:
+                    skipped += 1
+                    continue
+                row = next(
+                    (
+                        r for r in self._details_rows()
+                        if r["month_day"] == query_md and r["time"] in (None, query_time)
+                    ),
+                    None,
+                )
+                if row is None:
+                    continue
+                match = (url, row, card, self._rows_as_observations(card))
+                skill_ok = self._skill_allowed_here()
+                if skill_ok and not self._row_full(row):
+                    return self._use_occurrence(event_date, time_range, match)
+                logger.info(
+                    f"{event_date} {time_range} in series '{card.get('name')}' is "
+                    f"{'full' if skill_ok else 'skill-restricted'}; checking the other series in that slot."
+                )
+                if skill_ok and eligible_fallback is None:
+                    eligible_fallback = match
+                if any_fallback is None:
+                    any_fallback = match
+            if fully_rendered:
+                break
+            # Part of the list never rendered, so the series that fits (or has
+            # the date at all) may be further down: scroll and check the rest.
+            fully_rendered = True
+            if not on_list:
                 self._go_to_events_page(attempts=attempts, wait_time=list_wait)
-            url = self._open_details_from_card(card["card_id"])
-            for row in self._details_rows():
-                if row["month_day"] == query_md and (row["time"] in (None, query_time)):
-                    self.last_details_card = card
-                    self.last_details_rows = self._rows_as_observations(card)
-                    logger.info(
-                        f"Found {event_date} {time_range} in series '{card.get('name')}' "
-                        f"(row {row['index']}, {'not open: ' + row['not_open'] if row['not_open'] else 'open: ' + str(row['slots'])})"
-                    )
-                    return url, row, card
+                on_list = True
+            self._display_all_events_by_scrolling()
+            batch = [
+                c for c in self._series_candidates(event_date, time_range) if c["card_id"] not in visited
+            ]
+            if not batch:
+                break
+
+        # A full series the user may join explains itself (EventFull) better
+        # than a skill restriction on another series in the slot.
+        fallback = eligible_fallback or any_fallback
+        if fallback is not None:
+            if self.driver.current_url != fallback[0]:
+                # Callers read the restriction off the page, so show this series.
+                self._get_with_retry(fallback[0])
+                self._wait_for_details_page(timeout=list_wait)
+            return self._use_occurrence(event_date, time_range, fallback)
         raise EventNotFound(
             f"No listed series has {event_date} {time_range} "
-            f"({len(candidates)} candidate series checked)"
+            f"({len(visited)} candidate series checked"
+            + (f", {skipped} not on the reloaded list" if skipped else "")
+            + ")"
         )
+
+    def _list_fully_rendered(self):
+        total = self._total_events_count()
+        return total is None or len(self._list_card_ids()) >= total
+
+    @staticmethod
+    def _row_full(row):
+        return row["not_open"] is None and bool(row["slots"]) and "full" in row["slots"].lower()
+
+    def _skill_allowed_here(self):
+        """Whether the current details page's skill restriction allows this user."""
+        restriction = self._details_restriction()
+        return not restriction or self._skill_level_allowed(restriction)
+
+    def _use_occurrence(self, event_date, time_range, match):
+        url, row, card, observations = match
+        self.last_details_card = card
+        self.last_details_rows = observations
+        logger.info(
+            f"Found {event_date} {time_range} in series '{card.get('name')}' "
+            f"(row {row['index']}, {'not open: ' + row['not_open'] if row['not_open'] else 'open: ' + str(row['slots'])})"
+        )
+        return url, row, card
 
     def _rows_as_observations(self, card):
         """Every date on the current details page in scan_listed_events format,
@@ -848,7 +998,11 @@ class Website:
                 element = self.driver.find_element(By.CSS_SELECTOR, DETAILS_ROW(row["index"]))
                 self.driver.execute_script("arguments[0].click();", element)
                 try:
-                    self._wait(lambda d: self._header_month_day() == target, f"{event_date} to be selected", 5)
+                    self._wait(
+                        lambda d: self._header_month_day() == target,
+                        f"{event_date} to be selected",
+                        min(5, getattr(self, "wait_time", 30)),
+                    )
                     return
                 except TimeoutException:
                     break
@@ -876,40 +1030,138 @@ class Website:
         self._check_restriction()
 
         label = self._details_button_label()
+        opens_in = None
+        if label not in OPEN_LABELS:
+            label, opens_in = self._wait_for_opening(event_date, time_range, details_url)
         if label in REGISTERED_LABELS:
             logger.info(f"Already registered for {event_date} {time_range} ('{label}').")
             return
         if label == LABEL_WAITLIST:
             raise EventFull(f"{event_date} {time_range} is full (waitlist only).")
         if label != LABEL_REGISTER:
-            raise RegistrationError(
+            if opens_in is None:
+                # No countdown for the date: it's open (or the page is broken),
+                # so a missing or unexpected button is a real failure, not
+                # "not open yet".
+                raise RegistrationError(
+                    f"No Register button for {event_date} {time_range} (button: {label or 'none'}) "
+                    "and no registration countdown for that date."
+                )
+            raise RegistrationNotOpen(
                 f"No Register button for {event_date} {time_range} (button: {label or 'none'}); "
-                f"registration may not be open. {self._text(DETAILS_SIGNUP_MESSAGE) or ''}".strip()
+                f"registration may not be open. {self._text(DETAILS_SIGNUP_MESSAGE) or ''}".strip(),
+                opens_in=opens_in,
             )
 
-        button = self.driver.find_element(By.CSS_SELECTOR, DETAILS_REGISTER_BTN)
-        try:
-            button.click()
-        except (ElementClickInterceptedException, WebDriverException):
-            logger.warning("Native click on Register was intercepted; falling back to JS click.")
-            self.driver.execute_script("arguments[0].click();", button)
+        self._click(self.driver.find_element(By.CSS_SELECTOR, DETAILS_REGISTER_BTN), "Register")
         logger.info(f"Clicked Register for {event_date} {time_range} (user '{self.user_tag}').")
 
-        self._finalize_signup(event_date)
-        self._verify_registered(event_date, time_range, details_url)
+        outcome = self._finalize_signup(event_date)
+        self._verify_registered(event_date, time_range, details_url, outcome)
         logger.info(f"Registered for {event_date} {time_range} (user '{self.user_tag}').")
+
+    def _click(self, element, what):
+        try:
+            element.click()
+        except JS_CLICK_FALLBACK_ERRORS as e:
+            logger.warning(f"Native click on {what} failed ({type(e).__name__}); falling back to JS click.")
+            self.driver.execute_script("arguments[0].click();", element)
+
+    def _selected_opens_in(self, event_date, time_range):
+        """The requested date's registration countdown: its row's not-open
+        text, else the header's signup message when the header is that date."""
+        target = _parse_month_day(event_date or "")
+        query_time = _parse_time_range(time_range or "")
+        for row in self._details_rows():
+            if (
+                row["month_day"] == target
+                and row["time"] in (None, query_time)
+                and row["opens_in"] is not None
+            ):
+                return row["opens_in"]
+        if self._header_month_day() == target:
+            return _parse_opens_in(self._text(DETAILS_SIGNUP_MESSAGE))
+        return None
+
+    def _wait_for_opening(self, event_date, time_range, details_url):
+        """When the date opens within OPENING_SOON, reloads the details page
+        until its Register button shows up (or OPENING_WAIT passes).
+
+        The scheduler clicks seconds after the expected opening, so a
+        countdown of a minute or two usually means the site's clock is a
+        little behind, not that the time is wrong. Returns (button label,
+        countdown last seen)."""
+        label = self._details_button_label()
+        opens_in = self._selected_opens_in(event_date, time_range)
+        if opens_in is None or opens_in > OPENING_SOON:
+            return label, opens_in
+        logger.info(
+            f"{event_date} {time_range} opens in {opens_in}; reloading until Register appears."
+        )
+        deadline = time.monotonic() + OPENING_WAIT.total_seconds()
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            # No point waiting the full interval when the countdown is shorter.
+            time.sleep(min(OPENING_RELOAD_SECONDS, max(opens_in.total_seconds(), 1), remaining))
+            try:
+                self._get_with_retry(details_url)
+                self._wait_for_details_page()
+            except WebDriverException as e:  # includes TimeoutException
+                # The site is busiest right at the opening; keep trying.
+                logger.warning(f"Reload while waiting for {event_date} to open failed: {e}")
+                continue
+            self._select_date(event_date, time_range)
+            label = self._details_button_label()
+            if label in OPEN_LABELS:
+                return label, None
+            seen = self._selected_opens_in(event_date, time_range)
+            if seen is not None:
+                opens_in = seen
+        logger.warning(f"{event_date} {time_range} still not open after {OPENING_WAIT}.")
+        return label, opens_in
+
+    def _on_signup_page(self):
+        try:
+            if "SignUpToEvent" in (self.driver.current_url or ""):
+                return True
+        except WebDriverException:
+            pass
+        return bool(
+            self.driver.find_elements(By.CSS_SELECTOR, SIGNUP_DATE)
+            or self.driver.find_elements(By.CSS_SELECTOR, SIGNUP_SUBMIT_BTN)
+        )
+
+    def _ineligible_text(self):
+        """Visible 'not eligible' text on the page, or None."""
+        for element in self.driver.find_elements(By.XPATH, INELIGIBLE_XPATH):
+            try:
+                if element.is_displayed():
+                    return element.text.strip()
+            except StaleElementReferenceException:
+                continue
+        return None
 
     def _finalize_signup(self, event_date):
         """On the signup page Register leads to, checks it's for the requested
-        date and clicks 'Finalize Registration' - the step that registers."""
+        date and clicks 'Finalize Registration' - the step that registers.
+
+        Returns (whether the browser left the signup page, a description)."""
 
         def signup_page(driver):
-            ineligible = driver.find_elements(By.XPATH, INELIGIBLE_XPATH)
-            if ineligible:
-                return "ineligible", ineligible[0].text.strip()
-            submit = driver.find_elements(By.CSS_SELECTOR, SIGNUP_SUBMIT_BTN)
-            if submit:
+            # "not eligible" can appear in a details page's description, so
+            # it only counts once the signup page is showing.
+            if not self._on_signup_page():
+                return False
+            # The date is checked before finalizing, so wait for it too: it
+            # can render after the button.
+            submit = [e for e in driver.find_elements(By.CSS_SELECTOR, SIGNUP_SUBMIT_BTN) if e.is_enabled()]
+            if submit and _parse_month_day(self._text(SIGNUP_DATE) or ""):
                 return "ready", submit[0]
+            ineligible = self._ineligible_text()
+            if ineligible:
+                return "ineligible", ineligible
             return False
 
         kind, found = self._wait(signup_page, "the signup page's Finalize Registration button")
@@ -923,42 +1175,83 @@ class Website:
                 f"Signup page is for {signup_date!r}, not {event_date}; not finalizing."
             )
 
-        try:
-            found.click()
-        except (ElementClickInterceptedException, WebDriverException):
-            logger.warning("Native click on Finalize Registration was intercepted; falling back to JS click.")
-            self.driver.execute_script("arguments[0].click();", found)
+        # Text already there next to an enabled Finalize button isn't the
+        # signup's answer; only a new message after the click is.
+        stray_ineligible = self._ineligible_text()
+        self._click(found, "Finalize Registration")
         logger.info(f"Clicked Finalize Registration for {signup_date} (user '{self.user_tag}').")
 
         # Wait until the signup page is done (it navigates away or reports a
-        # problem) before checking the result.
+        # problem) before checking the result. Whether the site leaves the
+        # signup page on success isn't known, so staying there isn't an error.
+        submit_gone_since = []
+
         def finished(driver):
-            ineligible = driver.find_elements(By.XPATH, INELIGIBLE_XPATH)
-            if ineligible:
-                return "ineligible", ineligible[0].text.strip()
-            if not driver.find_elements(By.CSS_SELECTOR, SIGNUP_SUBMIT_BTN):
+            if not self._on_signup_page():
+                return "done", None
+            ineligible = self._ineligible_text()
+            if ineligible and ineligible != stray_ineligible:
+                return "ineligible", ineligible
+            if driver.find_elements(By.CSS_SELECTOR, SIGNUP_SUBMIT_BTN):
+                submit_gone_since.clear()
+                return False
+            if not submit_gone_since:
+                submit_gone_since.append(time.monotonic())
+            if time.monotonic() - submit_gone_since[0] >= SUBMIT_GONE_GRACE_SECONDS:
                 return "done", None
             return False
 
+        settle = min(FINALIZE_SETTLE_SECONDS, getattr(self, "wait_time", 30))
         try:
-            kind, message = self._wait(finished, "the signup to complete")
+            kind, message = self._wait(finished, "the signup to complete", timeout=settle)
         except TimeoutException:
             # Still on the signup page: the details page check below decides.
             kind, message = "unknown", None
         if kind == "ineligible":
             raise RegistrationError(f"Cannot register for event: {message}")
+        if kind == "unknown":
+            return False, f"the signup page still showed Finalize Registration after {settle} s"
+        return True, "the browser left the signup page"
 
-    def _verify_registered(self, event_date, time_range, details_url):
-        """Reloads the details page and requires the date to show as registered."""
+    def _verify_registered(self, event_date, time_range, details_url, outcome=None):
+        """Reloads the details page and requires the date to show as registered.
+
+        The reloaded header may show another date of the series (it resets
+        on every load), and whether clicking a date's row selects it isn't
+        known. Failing to get back to the date says nothing about the
+        registration, so that raises RegistrationUnverified rather than a
+        plain failure - unless the signup page never finished either, in
+        which case nothing suggests it went through.
+
+        `outcome` is (left the signup page, description) from _finalize_signup."""
         self._get_with_retry(details_url)
         self._wait_for_details_page()
-        self._select_date(event_date, time_range)
+        try:
+            self._select_date(event_date, time_range)
+        except RegistrationError:
+            left_signup, description = outcome or (True, "signup outcome unknown")
+            message = (
+                f"Finalize Registration was clicked for {event_date} {time_range} but the result "
+                f"couldn't be checked: {description}; details page shows "
+                f"{self._text(DETAILS_HEADER_DATE)!r}"
+            )
+            if not left_signup:
+                raise RegistrationError(message)
+            raise RegistrationUnverified(message)
         label = self._details_button_label()
-        if label not in REGISTERED_LABELS:
+        if label in REGISTERED_LABELS:
+            return
+        if label in (LABEL_REGISTER, LABEL_WAITLIST):
             raise RegistrationError(
                 f"Clicked Finalize Registration for {event_date} {time_range}, but the details "
-                f"page still shows '{label or 'no button'}' rather than a registration."
+                f"page still shows '{label}' rather than a registration."
             )
+        # What a registered date's button says hasn't been seen on the live
+        # site, so anything else may well be a registration.
+        raise RegistrationUnverified(
+            f"Finalize Registration was clicked for {event_date} {time_range} but the result "
+            f"couldn't be checked: the details page button reads '{label or 'nothing'}'"
+        )
 
     def close(self):
         """Closes the browser."""

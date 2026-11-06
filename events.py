@@ -14,6 +14,8 @@ EVENT_COLUMN_ADDITIONS = {
     "last_checked": "TIMESTAMP",
     "expected_event_day": "DATE",
     "request_ref": "TEXT",
+    # Times a registration found the date "not open yet" (see main.NOT_OPEN_LIMIT).
+    "not_open_count": "INTEGER NOT NULL DEFAULT 0",
 }
 
 
@@ -144,6 +146,17 @@ class Events:
                 user_tag TEXT PRIMARY KEY,
                 last_snapshot TIMESTAMP,
                 last_attempt TIMESTAMP
+            )
+        """
+        )
+        # Failed attempts per command email, so a transient error leaves the
+        # email for the next run instead of dropping the request.
+        self.cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS email_failures (
+                message_id TEXT PRIMARY KEY,
+                count INTEGER NOT NULL DEFAULT 0,
+                last_failure TIMESTAMP
             )
         """
         )
@@ -439,6 +452,20 @@ class Events:
         self.conn.commit()
         return self.cursor.rowcount > 0
 
+    def bump_not_open(self, event_date, time_range, user_tag):
+        """Counts one more "not open yet" outcome for a row. Returns the new count."""
+        spec = self.create_spec(event_date, time_range)
+        self.cursor.execute(
+            "UPDATE events SET not_open_count = not_open_count + 1 WHERE event_spec = ? AND user_tag = ?",
+            (spec, user_tag),
+        )
+        self.conn.commit()
+        self.cursor.execute(
+            "SELECT not_open_count FROM events WHERE event_spec = ? AND user_tag = ?", (spec, user_tag)
+        )
+        row = self.cursor.fetchone()
+        return row[0] if row else 0
+
     def mark_checked(self, event_date, time_range, user_tag, when=None):
         self.cursor.execute(
             "UPDATE events SET last_checked = ? WHERE event_spec = ? AND user_tag = ?",
@@ -551,6 +578,50 @@ class Events:
         self.cursor.execute("SELECT last_attempt FROM snapshots WHERE user_tag = ?", (user_tag,))
         row = self.cursor.fetchone()
         return _from_db_timestamp(row[0]) if row else None
+
+    def bump_email_failures(self, message_id, when=None):
+        """Counts one more failed attempt at an email. Returns the new count."""
+        self.cursor.execute(
+            """
+            INSERT INTO email_failures (message_id, count, last_failure) VALUES (?, 1, ?)
+            ON CONFLICT (message_id) DO UPDATE SET
+                count = email_failures.count + 1, last_failure = excluded.last_failure
+            """,
+            (message_id, _to_db_timestamp(when or datetime.now())),
+        )
+        self.conn.commit()
+        return self.get_email_failures(message_id)
+
+    def get_email_failures(self, message_id):
+        self.cursor.execute("SELECT count FROM email_failures WHERE message_id = ?", (message_id,))
+        row = self.cursor.fetchone()
+        return row[0] if row else 0
+
+    def clear_email_failures(self, message_id):
+        self.cursor.execute("DELETE FROM email_failures WHERE message_id = ?", (message_id,))
+        self.conn.commit()
+
+    def remove_old_email_failures(self, n_days):
+        """Forgets failure counts of emails that haven't failed for n_days
+        (they were handled, deleted, or archived by hand)."""
+        cutoff = _to_db_timestamp(datetime.now() - timedelta(days=n_days))
+        self.cursor.execute("DELETE FROM email_failures WHERE last_failure < ?", (cutoff,))
+        self.conn.commit()
+
+    def get_additional_info(self, event_date, time_range, user_tag):
+        self.cursor.execute(
+            "SELECT additional_info FROM events WHERE event_spec = ? AND user_tag = ?",
+            (self.create_spec(event_date, time_range), user_tag),
+        )
+        row = self.cursor.fetchone()
+        return row[0] if row else None
+
+    def set_additional_info(self, event_date, time_range, user_tag, additional_info):
+        self.cursor.execute(
+            "UPDATE events SET additional_info = ? WHERE event_spec = ? AND user_tag = ?",
+            (additional_info, self.create_spec(event_date, time_range), user_tag),
+        )
+        self.conn.commit()
 
     def close(self):
         self.conn.close()

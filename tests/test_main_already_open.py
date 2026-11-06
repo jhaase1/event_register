@@ -85,7 +85,8 @@ def env(monkeypatch, tmp_path):
     )
 
     state = SimpleNamespace(
-        client=client, db_path=db_path, registrations=[], success=True, archived_at_register=[]
+        client=client, db_path=db_path, registrations=[], success=True, archived_at_register=[],
+        unverified=False, reopens_at=None,
     )
 
     def fake_register(event_info, headless=True, results=None, results_lock=None):
@@ -93,7 +94,8 @@ def env(monkeypatch, tmp_path):
         state.archived_at_register.append(list(client.archived_ids))
         result = {"user_tag": event_info["user_tag"], "event": "x", "success": state.success}
         if not state.success:
-            result.update(error="signup timed out", traceback="tb")
+            result.update(error="signup timed out", traceback="tb", unverified=state.unverified,
+                          reopens_at=state.reopens_at)
         results.append(result)
 
     monkeypatch.setattr(main, "register_for_single_event", fake_register)
@@ -138,6 +140,22 @@ def test_already_open_registration_failure_tells_user_and_webmaster(env):
     assert env.client.notifications[0][0] == "Event registration failed"
     assert _rows(env.db_path) == []
     assert env.client.archived_ids == ["add-1"]
+
+
+def test_already_open_unverified_registration_is_recorded_and_user_asked_to_check(env):
+    FakeWebsite.registration_time = datetime.now()
+    env.success = False
+    env.unverified = True
+
+    main.check_for_new_event(headless=True)
+
+    body = env.client.replies[0].body
+    assert "couldn't confirm" in body and "check the website" in body
+    assert "didn't go through" not in body
+    assert len(env.client.notifications) == 1
+    rows = _rows(env.db_path)
+    assert len(rows) == 1
+    assert main.UNVERIFIED_INFO in rows[0][3]
 
 
 def test_future_registration_time_is_still_scheduled_not_registered(env):
@@ -267,3 +285,18 @@ def test_run_still_registers_open_events_when_earlier_steps_fail(monkeypatch):
     main.run(headless=True)
 
     assert calls == [1]
+
+
+def test_already_open_event_that_turns_out_not_open_is_scheduled_for_its_opening(env):
+    FakeWebsite.registration_time = datetime.now()
+    env.success = False
+    env.reopens_at = (datetime.now() + timedelta(days=1)).replace(hour=20, minute=0, second=0, microsecond=0)
+
+    main.check_for_new_event(headless=True)
+
+    assert f"opens at {env.reopens_at}" in env.client.replies[0].body
+    assert env.client.notifications == []
+    rows = _rows(env.db_path)
+    assert len(rows) == 1
+    assert rows[0][2] == env.reopens_at.strftime("%Y-%m-%d %H:%M:%S")
+    assert rows[0][4] == "confirmed"

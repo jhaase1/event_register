@@ -4,9 +4,15 @@ Models just enough of the real pages (captured Nov 2026) for website.py to run
 against: the events list (one card per recurring series) and each series'
 details page (one row per date, a header for the selected date, and a
 Register button). Selectors are matched the way website.py writes them.
+
+Behaviour the live site hasn't been seen to have is opt-in, so tests can't
+pass by relying on it: clicking a date row doesn't change the header unless
+Series.row_click_selects is set, and Finalize Registration stays on the
+signup page unless Series.finalize_navigates is set.
 """
 
 import re
+import time
 
 from selenium.common.exceptions import NoSuchElementException
 from selenium.webdriver.common.by import By
@@ -16,13 +22,16 @@ INELIGIBLE_MARK = "not eligible"
 
 
 class El:
-    def __init__(self, testid=None, text="", tag="div", children=(), on_click=None, role=None):
+    def __init__(self, testid=None, text="", tag="div", children=(), on_click=None, role=None,
+                 click_error=None, displayed=True):
         self.testid = testid
         self._text = text
         self.tag_name = tag
         self.children = list(children)
         self.on_click = on_click
         self.role = role
+        self.click_error = click_error  # raised by a native click only
+        self.displayed = displayed
 
     @property
     def text(self):
@@ -37,12 +46,17 @@ class El:
         return None
 
     def is_displayed(self):
-        return True
+        return self.displayed
 
     def is_enabled(self):
         return True
 
     def click(self):
+        if self.click_error is not None:
+            raise self.click_error
+        self.js_click()
+
+    def js_click(self):
         if self.on_click:
             self.on_click()
 
@@ -85,7 +99,11 @@ def _select(elements, by, selector):
     if by == By.TAG_NAME:
         return [e for e in elements if e.tag_name == selector]
     if by == By.XPATH and "not eligible" in selector:
-        return [e for e in elements if INELIGIBLE_MARK in (e._text or "").lower()]
+        # Like text(): an element's own text, never a script's or style's.
+        return [
+            e for e in elements
+            if INELIGIBLE_MARK in (e._text or "").lower() and e.tag_name not in ("script", "style")
+        ]
     raise AssertionError(f"fake doesn't support {by} {selector}")
 
 
@@ -97,17 +115,32 @@ class DateRow:
         self.slots = slots
         self.opens_in = opens_in
         self.registered = False
+        # Loads of the details page after which a not-open date opens.
+        self.opens_after_loads = None
 
 
 class Series:
     def __init__(self, card_id, rows, name="$3 Intermediate Pickleball", category="Intermediate Open Play",
-                 cost="FREE", restriction=None, details_code="ABC123"):
+                 cost="FREE", restriction=None, details_code="ABC123", description=None):
         self.card_id = str(card_id)
         self.rows = rows
         self.name, self.category, self.cost = name, category, cost
         self.restriction = restriction
         self.details_code = details_code
+        self.description = description
+        # The header shows default_row on every load of the details page.
+        self.default_row = 0
         self.selected = 0
+        self.row_click_selects = False
+        self.finalize_navigates = False
+        self.register_click_error = None  # raised by a native click on Register
+        # Renders of the signup page before its date header shows up.
+        self.signup_date_delay_renders = 0
+        self.signup_renders = 0
+        # Seconds Finalize shows a spinner (no button) before it registers;
+        # leaving the page before then abandons the registration.
+        self.finalize_spinner_seconds = None
+        self.signup_script_text = None  # text inside a <script> on the signup page
         # How the signup step behaves: 'register' (Finalize registers), 'nothing'
         # (Finalize has no effect), 'ineligible' (signup page says not eligible),
         # 'wrong_date' (signup page is for a different date).
@@ -126,7 +159,7 @@ class Series:
 class FakePortal:
     """Acts as the Selenium driver."""
 
-    def __init__(self, series, events_url="https://x/Online/Events/List/1"):
+    def __init__(self, series, events_url="https://x/Online/Events/List/1", lazy_cards=None):
         self.series = {s.card_id: s for s in series}
         self.events_url = events_url
         self.page = ("list", None)
@@ -135,14 +168,22 @@ class FakePortal:
         self.dialog = None
         self.ineligible = False
         self.render_list = True  # False: the list never finishes loading
+        # Cards rendered by a fresh list load before it's scrolled (None: all).
+        self.lazy_cards = lazy_cards
+        self.scrolled = False
         self.gets = []
         self.screenshots = []
+        self.pending = None  # (series, row, done_at) while a Finalize spinner runs
 
     # --- driver API -------------------------------------------------------
     def get(self, url):
+        if self.pending and time.monotonic() < self.pending[2]:
+            self.pending = None  # left before the request finished
+        self._settle_pending()
         self.gets.append(url)
         self.dialog = None
         self.current_url = url
+        self.scrolled = False
         if "SignUpToEvent" in url:
             # The signup URL also carries the reservation number, so check it first.
             for s in self.series.values():
@@ -155,6 +196,12 @@ class FakePortal:
         for s in self.series.values():
             if s.details_code in url:
                 self.page = ("details", s.card_id)
+                s.selected = s.default_row
+                for row in s.rows:
+                    if row.opens_after_loads is not None:
+                        row.opens_after_loads -= 1
+                        if row.opens_after_loads <= 0:
+                            row.state, row.opens_after_loads = "open", None
                 return
         self.page = ("other", None)
 
@@ -170,7 +217,13 @@ class FakePortal:
 
     def execute_script(self, script, *args):
         if "click()" in script and args:
-            args[0].click()
+            args[0].js_click()
+        if "scrollTo" in script:
+            self.scrolled = True
+
+    def execute(self, command, params=None):
+        # ActionChains (the wheel scroll) sends W3C actions through here.
+        return {"value": None}
 
     def find_elements(self, by, selector):
         return _select(list(self._root().walk()), by, selector)
@@ -184,8 +237,18 @@ class FakePortal:
     def quit(self):
         pass
 
+    def _settle_pending(self):
+        if not self.pending or time.monotonic() < self.pending[2]:
+            return
+        series, target, _done_at = self.pending
+        self.pending = None
+        target.registered = True
+        if series.finalize_navigates:
+            self.get(f"https://x/Online/Events/Details/1/{series.details_code}?resId=1")
+
     # --- page models ------------------------------------------------------
     def _root(self):
+        self._settle_pending()
         kind, card_id = self.page
         if kind == "list":
             children = self._list_page() if self.render_list else [El(text="Loading...")]
@@ -208,7 +271,10 @@ class FakePortal:
 
     def _list_page(self):
         cards = []
-        for s in self.series.values():
+        series = list(self.series.values())
+        if self.lazy_cards is not None and not self.scrolled:
+            series = series[: self.lazy_cards]
+        for s in series:
             first = s.rows[0]
             cid = s.card_id
 
@@ -226,7 +292,7 @@ class FakePortal:
                 El(testid=f"events-list-view-upcoming-dates-btn-{cid}", text="VIEW UPCOMING DATES", tag="button",
                    on_click=open_details),
             ]))
-        header = El(testid="events-list-results-header", text=f"{len(cards)} events found")
+        header = El(testid="events-list-results-header", text=f"{len(self.series)} events found")
         return [header, El(testid="events-list-grid", children=cards)]
 
     def _signup_page(self, s):
@@ -234,17 +300,26 @@ class FakePortal:
         shown = s.rows[(s.selected + 1) % len(s.rows)] if s.on_register == "wrong_date" else row
 
         def finalize(series=s, target=row):
-            if series.on_register == "register":
+            if series.on_register == "register" and series.finalize_spinner_seconds:
+                self.pending = (series, target, time.monotonic() + series.finalize_spinner_seconds)
+            elif series.on_register == "register":
                 target.registered = True
-                # The site moves on from the signup page after finalizing.
-                self.get(f"https://x/Online/Events/Details/1/{series.details_code}?resId=1")
+                if series.finalize_navigates:
+                    self.get(f"https://x/Online/Events/Details/1/{series.details_code}?resId=1")
 
-        children = [El(testid="event-signup-page", children=[
-            El(testid="event-signup-header-date", text=f"{self._date_text(shown).replace('th', '').replace('st', '').replace('nd', '').replace('rd', '')}, 2026"),
+        s.signup_renders += 1
+        header = []
+        if s.signup_renders > s.signup_date_delay_renders:
+            header.append(El(testid="event-signup-header-date", text=f"{self._date_text(shown).replace('th', '').replace('st', '').replace('nd', '').replace('rd', '')}, 2026"))
+        children = [El(testid="event-signup-page", children=header + [
             El(testid="event-signup-header-time", text=row.time_text),
             El(testid="event-signup-total-due", text="$0.00"),
         ])]
-        if s.on_register == "ineligible":
+        if s.signup_script_text:
+            children.append(El(tag="script", text=s.signup_script_text))
+        if self.pending and self.pending[0] is s:
+            children.append(El(text="Processing..."))
+        elif s.on_register == "ineligible":
             children.append(El(text="You are not eligible to register for this event."))
         else:
             children.append(El(testid="event-signup-submit-btn", text="Finalize Registration", tag="button",
@@ -256,7 +331,8 @@ class FakePortal:
         rows = []
         for i, row in enumerate(s.rows):
             def select(series=s, index=i):
-                series.selected = index
+                if series.row_click_selects:
+                    series.selected = index
 
             status = (
                 El(testid=f"events-details-date-not-open-{i}", text=row.opens_in)
@@ -289,7 +365,10 @@ class FakePortal:
             children.append(El(
                 testid="events-details-register-btn events-details-register-single-btn register-btn",
                 text=s.row_label(selected), tag="button", on_click=register,
+                click_error=s.register_click_error,
             ))
+        if s.description:
+            children.append(El(testid="events-details-description", text=s.description))
         children.append(El(testid="events-details-dates-list", children=rows))
         if s.restriction:
             children.append(El(testid="events-details-side-restriction-0",
