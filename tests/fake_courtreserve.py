@@ -108,7 +108,9 @@ class Series:
         self.restriction = restriction
         self.details_code = details_code
         self.selected = 0
-        # What the details-page Register click does: 'register', 'dialog', 'nothing', 'ineligible'.
+        # How the signup step behaves: 'register' (Finalize registers), 'nothing'
+        # (Finalize has no effect), 'ineligible' (signup page says not eligible),
+        # 'wrong_date' (signup page is for a different date).
         self.on_register = "register"
 
     def row_label(self, row):
@@ -141,6 +143,12 @@ class FakeCourtReserve:
         self.gets.append(url)
         self.dialog = None
         self.current_url = url
+        if "SignUpToEvent" in url:
+            # The signup URL also carries the reservation number, so check it first.
+            for s in self.series.values():
+                if s.details_code in url:
+                    self.page = ("signup", s.card_id)
+                    return
         if url == self.events_url:
             self.page = ("list", None)
             return
@@ -183,6 +191,8 @@ class FakeCourtReserve:
             children = self._list_page() if self.render_list else [El(text="Loading...")]
         elif kind == "details":
             children = self._details_page(self.series[card_id])
+        elif kind == "signup":
+            children = self._signup_page(self.series[card_id])
         else:
             children = []
         if self.dialog is not None:
@@ -219,6 +229,28 @@ class FakeCourtReserve:
         header = El(testid="events-list-results-header", text=f"{len(cards)} events found")
         return [header, El(testid="events-list-grid", children=cards)]
 
+    def _signup_page(self, s):
+        row = s.rows[s.selected]
+        shown = s.rows[(s.selected + 1) % len(s.rows)] if s.on_register == "wrong_date" else row
+
+        def finalize(series=s, target=row):
+            if series.on_register == "register":
+                target.registered = True
+                # The site moves on from the signup page after finalizing.
+                self.get(f"https://x/Online/Events/Details/1/{series.details_code}?resId=1")
+
+        children = [El(testid="event-signup-page", children=[
+            El(testid="event-signup-header-date", text=f"{self._date_text(shown).replace('th', '').replace('st', '').replace('nd', '').replace('rd', '')}, 2026"),
+            El(testid="event-signup-header-time", text=row.time_text),
+            El(testid="event-signup-total-due", text="$0.00"),
+        ])]
+        if s.on_register == "ineligible":
+            children.append(El(text="You are not eligible to register for this event."))
+        else:
+            children.append(El(testid="event-signup-submit-btn", text="Finalize Registration", tag="button",
+                               on_click=finalize))
+        return children
+
     def _details_page(self, s):
         selected = s.rows[s.selected]
         rows = []
@@ -238,20 +270,10 @@ class FakeCourtReserve:
                 status,
             ]))
 
-        def register(series=s, row=selected):
-            if series.on_register == "register":
-                row.registered = True
-            elif series.on_register == "dialog":
-                def confirm():
-                    row.registered = True
-                    self.dialog = None
-                self.dialog = El(role="dialog", children=[
-                    El(text="Confirm your registration"),
-                    El(text="Cancel", tag="button"),
-                    El(text="Confirm", tag="button", on_click=confirm),
-                ])
-            elif series.on_register == "ineligible":
-                self.ineligible = True
+        def register(series=s):
+            # Like the live site: Register only opens the signup page.
+            self.get(f"https://x/Online/Events/SignUpToEvent/1?eventId={series.card_id}"
+                     f"&reservationNumber={series.details_code}")
 
         children = [
             El(testid="events-details-page", children=[

@@ -118,20 +118,15 @@ LABEL_WAITLIST = "join waitlist"
 REGISTERED_LABELS = ("edit registration", "cancel registration", "registered")
 OPEN_LABELS = (LABEL_REGISTER, LABEL_WAITLIST) + REGISTERED_LABELS
 
-# Old signup page (kept in case the Register click still lands on it).
-SAVE_BTN = "[data-testid='save-btn']"
+# Signup page the details-page Register button navigates to
+# (/Online/Events/SignUpToEvent/...). Nothing is registered until
+# "Finalize Registration" is clicked (verified on the live site, Nov 2026).
+SIGNUP_DATE = _testid("event-signup-header-date")      # "Thu, Nov 12, 2026"
+SIGNUP_SUBMIT_BTN = _testid("event-signup-submit-btn")  # "Finalize Registration"
 CONTINUE_BUTTON = "button[data-testid='Continue']"
 INELIGIBLE_XPATH = (
     "//*[contains(translate(., "
     "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'not eligible')]"
-)
-DIALOG = "[role='dialog'], .ant-modal, .ant-drawer"
-# Buttons that complete a registration if the Register click opens a dialog.
-CONFIRM_LABELS = ("save", "confirm", "complete registration", "submit", "sign up", "finish", "register")
-SUCCESS_TEXT_RE = re.compile(
-    r"(successfully registered|you are registered|you're registered|registration (is )?complete"
-    r"|registration successful|registered successfully)",
-    re.IGNORECASE,
 )
 
 FAILURE_DIR = os.path.join("logs", "failures")
@@ -877,6 +872,7 @@ class Website:
             event_url, _row, _card = self._find_occurrence(event_date, time_range)
 
         self._select_date(event_date, time_range)
+        details_url = self.driver.current_url
         self._check_restriction()
 
         label = self._details_button_label()
@@ -899,54 +895,70 @@ class Website:
             self.driver.execute_script("arguments[0].click();", button)
         logger.info(f"Clicked Register for {event_date} {time_range} (user '{self.user_tag}').")
 
-        self._complete_registration(event_date, time_range)
+        self._finalize_signup(event_date)
+        self._verify_registered(event_date, time_range, details_url)
         logger.info(f"Registered for {event_date} {time_range} (user '{self.user_tag}').")
 
-    def _complete_registration(self, event_date, time_range):
-        """Finishes whatever the Register click opened and confirms success.
+    def _finalize_signup(self, event_date):
+        """On the signup page Register leads to, checks it's for the requested
+        date and clicks 'Finalize Registration' - the step that registers."""
 
-        The new Register button is a JS action, so this accepts any of: the
-        details page flipping to 'Edit Registration', a success message, the
-        old signup page's Save button, or a dialog with a confirm-type button
-        (clicked once). Anything else is reported, not assumed.
-        """
-        confirmed_clicks = 0
-
-        def outcome(driver):
-            nonlocal confirmed_clicks
+        def signup_page(driver):
             ineligible = driver.find_elements(By.XPATH, INELIGIBLE_XPATH)
             if ineligible:
                 return "ineligible", ineligible[0].text.strip()
-            if self._details_button_label() in REGISTERED_LABELS:
-                return "registered", None
-            body = driver.find_element(By.TAG_NAME, "body").text
-            if SUCCESS_TEXT_RE.search(body):
-                return "registered", None
-            if confirmed_clicks < 2:
-                target = self._confirm_button()
-                if target is not None:
-                    confirmed_clicks += 1
-                    logger.info(f"Clicking '{target.text.strip()}' to complete registration.")
-                    driver.execute_script("arguments[0].click();", target)
+            submit = driver.find_elements(By.CSS_SELECTOR, SIGNUP_SUBMIT_BTN)
+            if submit:
+                return "ready", submit[0]
             return False
 
-        kind, message = self._wait(outcome, f"confirmation that {event_date} {time_range} was registered")
+        kind, found = self._wait(signup_page, "the signup page's Finalize Registration button")
+        if kind == "ineligible":
+            raise RegistrationError(f"Cannot register for event: {found}")
+
+        # Never finalize a different date than the one requested.
+        signup_date = self._text(SIGNUP_DATE)
+        if _parse_month_day(signup_date or "") != _parse_month_day(event_date or ""):
+            raise RegistrationError(
+                f"Signup page is for {signup_date!r}, not {event_date}; not finalizing."
+            )
+
+        try:
+            found.click()
+        except (ElementClickInterceptedException, WebDriverException):
+            logger.warning("Native click on Finalize Registration was intercepted; falling back to JS click.")
+            self.driver.execute_script("arguments[0].click();", found)
+        logger.info(f"Clicked Finalize Registration for {signup_date} (user '{self.user_tag}').")
+
+        # Wait until the signup page is done (it navigates away or reports a
+        # problem) before checking the result.
+        def finished(driver):
+            ineligible = driver.find_elements(By.XPATH, INELIGIBLE_XPATH)
+            if ineligible:
+                return "ineligible", ineligible[0].text.strip()
+            if not driver.find_elements(By.CSS_SELECTOR, SIGNUP_SUBMIT_BTN):
+                return "done", None
+            return False
+
+        try:
+            kind, message = self._wait(finished, "the signup to complete")
+        except TimeoutException:
+            # Still on the signup page: the details page check below decides.
+            kind, message = "unknown", None
         if kind == "ineligible":
             raise RegistrationError(f"Cannot register for event: {message}")
 
-    def _confirm_button(self):
-        """A completing button on the old signup page or inside a dialog, if any."""
-        save = self.driver.find_elements(By.CSS_SELECTOR, SAVE_BTN)
-        if save:
-            return save[0]
-        for dialog in self.driver.find_elements(By.CSS_SELECTOR, DIALOG):
-            if not dialog.is_displayed():
-                continue
-            for button in dialog.find_elements(By.CSS_SELECTOR, "button"):
-                text = (button.text or "").strip().lower()
-                if text in CONFIRM_LABELS and button.is_displayed() and button.is_enabled():
-                    return button
-        return None
+    def _verify_registered(self, event_date, time_range, details_url):
+        """Reloads the details page and requires the date to show as registered."""
+        self._get_with_retry(details_url)
+        self._wait_for_details_page()
+        self._select_date(event_date, time_range)
+        label = self._details_button_label()
+        if label not in REGISTERED_LABELS:
+            raise RegistrationError(
+                f"Clicked Finalize Registration for {event_date} {time_range}, but the details "
+                f"page still shows '{label or 'no button'}' rather than a registration."
+            )
 
     def close(self):
         """Closes the browser."""

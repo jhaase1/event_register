@@ -215,7 +215,7 @@ def _details_url(code):
     return f"https://x/Online/Events/Details/1/{code}?resId=1"
 
 
-def test_register_clicks_register_and_confirms_the_button_flipped():
+def test_register_finalizes_on_the_signup_page_and_verifies():
     series = standard_series()
     site, fake = make_site(series)
 
@@ -223,27 +223,33 @@ def test_register_clicks_register_and_confirms_the_button_flipped():
 
     assert series[0].rows[0].registered is True
     assert fake.gets[0] == _details_url("SERIES101")
+    assert any("SignUpToEvent" in url for url in fake.gets)
+    # Re-checked the details page afterwards.
+    assert fake.gets[-1].startswith("https://x/Online/Events/Details/1/SERIES101")
 
 
-def test_register_completes_a_confirmation_dialog():
-    series = standard_series()
-    series[0].on_register = "dialog"
-    site, _fake = make_site(series)
-
-    site.register_for_event(req(D1), "11a - 1p", _details_url("SERIES101"))
-
-    assert series[0].rows[0].registered is True
-
-
-def test_register_raises_when_outcome_cannot_be_confirmed():
+def test_register_raises_when_finalize_does_not_take_effect():
     series = standard_series()
     series[0].on_register = "nothing"
     site, _fake = make_site(series)
 
-    with pytest.raises(website.TimeoutException) as error:
+    with pytest.raises(website.RegistrationError) as error:
         site.register_for_event(req(D1), "11a - 1p", _details_url("SERIES101"))
 
-    assert "confirmation" in str(error.value)
+    assert "still shows 'register'" in str(error.value)
+    assert series[0].rows[0].registered is False
+
+
+def test_register_refuses_to_finalize_a_different_date():
+    series = standard_series()
+    series[0].on_register = "wrong_date"
+    site, _fake = make_site(series)
+
+    with pytest.raises(website.RegistrationError) as error:
+        site.register_for_event(req(D1), "11a - 1p", _details_url("SERIES101"))
+
+    assert "not finalizing" in str(error.value)
+    assert all(not r.registered for r in series[0].rows)
 
 
 def test_register_reports_ineligible_message():
@@ -266,12 +272,11 @@ def test_register_full_session_raises_event_full():
 def test_register_when_already_registered_does_nothing():
     series = standard_series()
     series[0].rows[0].registered = True
-    series[0].on_register = "ineligible"  # would fail if clicked
     site, fake = make_site(series)
 
     site.register_for_event(req(D1), "11a - 1p", _details_url("SERIES101"))
 
-    assert fake.ineligible is False
+    assert not any("SignUpToEvent" in url for url in fake.gets)
 
 
 def test_register_selects_the_requested_date_when_header_shows_another():
@@ -298,12 +303,11 @@ def test_register_refuses_a_date_not_open_yet():
 
 def test_register_checks_skill_restriction_before_clicking():
     series = standard_series()
-    series[2].on_register = "ineligible"
     site, fake = make_site(series)
 
     with pytest.raises(website.SkillLevelIneligible):
         site.register_for_event(req(D1), "4p - 6p", _details_url("SERIES303"))
-    assert fake.ineligible is False
+    assert not any("SignUpToEvent" in url for url in fake.gets)
 
 
 def test_register_without_url_finds_the_series_first():
