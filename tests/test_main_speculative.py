@@ -1512,3 +1512,152 @@ def test_default_poll_schedule_starts_before_opening_and_keeps_looking_for_a_min
     assert offsets == [-10, 1, 3, 6, 10, 20, 40, 60]
     assert min(offsets) < 0 <= max(offsets)
     assert main._valid_poll_offsets(offsets) == offsets
+
+
+# --- CourtReserve redesign: inbox isolation, full sessions, diagnostics ------
+
+
+class _SnapshottingWebsite(FakeWebsite):
+    snapshots_taken = []
+
+    def capture_failure(self, label):
+        _SnapshottingWebsite.snapshots_taken.append(label)
+        return [f"logs/failures/{label}.png"]
+
+
+def _two_emails():
+    first = _make_email("first")
+    second = SimpleNamespace(**dict(vars(_make_email("second")), id="msg-2", thread_id="thread-2"))
+    return first, second
+
+
+def test_one_failing_email_does_not_block_the_rest_of_the_inbox(monkeypatch, db_path, fake_site):
+    _SnapshottingWebsite.snapshots_taken = []
+    first, second = _two_emails()
+    client = FakeEmailClient(emails=[first, second])
+    monkeypatch.setattr(main, "EmailClient", lambda: client)
+    monkeypatch.setattr(main, "Website", _SnapshottingWebsite)
+    monkeypatch.setattr(main, "extract_user_tag", lambda *_a, **_k: "default")
+    monkeypatch.setattr(main, "validate_user_tag", lambda tag: tag)
+    monkeypatch.setattr(main, "is_sender_allowed", lambda *_a, **_k: True)
+    monkeypatch.setattr(main, "load_user_config", lambda _tag: {})
+    monkeypatch.setattr(
+        main, "extract_user_intent",
+        lambda e: ("add", ("Wed, Nov 11th", "11a - 1p") if e.id == "msg-1" else (_date_text(REQUESTED_DAY), SLOT_TEXT)),
+    )
+    later = datetime.combine(REQUESTED_DAY - timedelta(days=7), datetime.min.time()).replace(hour=20)
+
+    def outcome(event_date, time_range):
+        if event_date == "Wed, Nov 11th":
+            raise main.WebDriverException("Timed out after 30s waiting for the events list")
+        return later, "info"
+
+    fake_site.outcome = outcome  # FakeWebsite reads its own class attribute
+
+    main.check_for_new_event(headless=True)
+
+    # Both emails handled and taken out of the inbox.
+    assert client.archived_ids == ["msg-1", "msg-2"]
+    assert client.marked_read_ids == ["msg-1", "msg-2"]
+    bodies = {r.email.id: r.body for r in client.replies}
+    assert "Something went wrong" in bodies["msg-1"]
+    assert "I determined I need to register" in bodies["msg-2"]
+    # The webmaster is told, with the snapshot.
+    assert len(client.notifications) == 1
+    assert "logs/failures/email_default.png" in client.notifications[0][1]
+    assert _SnapshottingWebsite.snapshots_taken == ["email_default"]
+
+
+def test_full_session_gets_a_polite_reply_without_webmaster_mail(monkeypatch, db_path, fake_site):
+    def full(*_a):
+        raise main.EventFull("full")
+
+    fake_site.outcome = full
+    client = _wire_email_flow(monkeypatch, _make_email("x"))
+
+    main.check_for_new_event(headless=True)
+
+    assert "already full" in client.replies[0].body
+    assert client.notifications == []
+    assert client.archived_ids == ["msg-1"]
+
+
+def test_refresh_drops_speculative_row_that_turned_out_full(refresh_env):
+    _seed_speculative(refresh_env.db_path)
+
+    def full(*_a):
+        raise main.EventFull("full")
+
+    refresh_env.site.outcome = full
+
+    main.refresh_schedule_and_confirm_speculative(headless=True)
+
+    db = _open(refresh_env.db_path)
+    assert db.list_all_events("default") == []
+    db.close()
+    assert "already full" in refresh_env.client.replies[0].body
+
+
+def test_series_dates_seen_on_details_page_are_recorded_with_their_countdowns(monkeypatch, db_path, fake_site):
+    later_week = REQUESTED_DAY + timedelta(days=7)
+
+    class WithRows(FakeWebsite):
+        last_details_rows = [
+            {"month_day": (later_week.month, later_week.day), "time": (9, 0, 11, 0), "name": "Drop-in",
+             "category": "Open Play", "actionable": False, "opens_in": timedelta(days=13, hours=23)},
+        ]
+
+    monkeypatch.setattr(main, "Website", WithRows)
+    fake_site.outcome = lambda *_a: (datetime.now() + timedelta(days=2), "info")
+    _wire_email_flow(monkeypatch, _make_email("x"))
+
+    main.check_for_new_event(headless=True)
+
+    db = _open(db_path)
+    obs = db.get_observations("default", since=TODAY)
+    db.close()
+    assert [(o["event_day"], o["lead_source"]) for o in obs] == [(later_week, "countdown")]
+
+
+def test_registration_failure_snapshot_is_in_the_failure_email(monkeypatch, db_path):
+    class FailingSite(FakeRegisterSite):
+        def find_event_url(self, *a, **k):
+            return "https://x/Details/1"
+
+        def register_for_event(self, *a, **k):
+            raise main.WebDriverException("Timed out after 30s waiting for confirmation")
+
+        def capture_failure(self, label):
+            return [f"logs/failures/{label}.png", f"logs/failures/{label}.html"]
+
+    _seed_speculative(db_path, registration_time=datetime.now() + timedelta(minutes=5))
+    client = FakeEmailClient()
+    monkeypatch.setattr(main, "EmailClient", lambda: client)
+    monkeypatch.setattr(main, "is_within_offset", lambda *_a, **_k: True)
+    monkeypatch.setattr(main, "dwell_until", lambda *_a, **_k: None)
+    monkeypatch.setattr(main, "Website", FailingSite)
+
+    main.register_for_next_event(headless=True)
+
+    body = client.notifications[0][1]
+    assert "logs/failures/register_default.png" in body
+    assert "waiting for confirmation" in body
+
+
+@pytest.mark.parametrize("outcome, decision", [
+    (_not_found, "wait"),
+    (lambda *_a: (datetime.combine(REQUESTED_DAY - timedelta(days=7), datetime.min.time()).replace(hour=20), "i"),
+     "confirm"),
+])
+def test_every_speculative_check_logs_one_decision_line(refresh_env, caplog, outcome, decision):
+    _seed_speculative(refresh_env.db_path)
+    refresh_env.site.outcome = outcome
+    caplog.set_level("INFO", logger="__main__")
+    caplog.set_level("INFO", logger="main")
+
+    main.refresh_schedule_and_confirm_speculative(headless=True)
+
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Speculative check")]
+    assert len(lines) == 1
+    assert f": {decision} - " in lines[0]
+    assert "predicted opening" in lines[0]
