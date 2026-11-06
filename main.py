@@ -2,7 +2,7 @@ import textile
 from tabulate import tabulate
 import json
 from events import Events
-from website import Website, SkillLevelIneligible, EventNotFound
+from website import Website, SkillLevelIneligible, EventNotFound, EventFull
 from selenium.common.exceptions import WebDriverException
 from dwell import dwell_until, is_within_offset
 from email_client import EmailClient
@@ -238,6 +238,7 @@ def register_for_single_event(
             exc_info=True,
         )
         tb = traceback.format_exc()
+        snapshots = _capture_failure(website, f"register_{user_tag}")
         _record_result(
             {
                 "user_tag": user_tag,
@@ -246,6 +247,7 @@ def register_for_single_event(
                 "error": str(e),
                 "traceback": tb,
                 "registration_time": registration_time,
+                "snapshots": snapshots,
             }
         )
     finally:
@@ -411,6 +413,71 @@ def register_for_next_event(headless=True):
     events.close()
 
 
+def _capture_failure(website, label):
+    """Saves a page snapshot for diagnosis; never raises (called from error handlers)."""
+    if website is None:
+        return []
+    try:
+        return website.capture_failure(label)
+    except Exception:
+        logger.warning("Could not capture a failure snapshot.", exc_info=True)
+        return []
+
+
+def _handle_email_failure(email_client, email, websites, user_tag, error, headless):
+    """Reports a request that failed unexpectedly and takes it out of the inbox."""
+    subject = getattr(email, "subject", "")
+    logger.error(f"Failed to process email {subject!r} (user '{user_tag}'): {error}", exc_info=True)
+    website = websites.get(user_tag) if user_tag else None
+    snapshots = _capture_failure(website, f"email_{user_tag}")
+    try:
+        email_client.reply_to_email(
+            email,
+            "Something went wrong while handling this request, so I couldn't act on it. "
+            "The webmaster has been notified. Please register on the website or try again later.",
+            user_tag=user_tag,
+        )
+    except Exception:
+        logger.exception("Could not reply about the failed request")
+    try:
+        email_client.send_notification(
+            subject="Event registration failed",
+            body=_format_failure_body(
+                {
+                    "user_tag": user_tag,
+                    "email_subject": subject,
+                    "reason": "error while processing a command email",
+                    "error": f"{type(error).__name__}: {error}",
+                    "traceback": traceback.format_exc(),
+                    "snapshots": ", ".join(snapshots) or None,
+                },
+                headless_flag=headless,
+            ),
+            user_tag=user_tag,
+        )
+    except Exception:
+        logger.exception("Could not notify the webmaster about the failed request")
+    try:
+        email_client.mark_email_as_read(email)
+        email_client.archive_email(email)
+    except Exception:
+        logger.exception("Could not mark the failed request as read")
+
+
+def _record_details_rows(events, website, user_tag):
+    """Saves every date seen on the last details page, with its exact
+    registration countdown, as schedule history."""
+    rows = getattr(website, "last_details_rows", None)
+    if not rows:
+        return
+    try:
+        now = datetime.now()
+        observations = [o for o in (schedule.to_observation(r, now) for r in rows) if o]
+        events.upsert_observations(user_tag, observations, seen_at=now)
+    except Exception:
+        logger.exception(f"Failed to record series dates for user '{user_tag}'")
+
+
 def _notify_registration_failures(failed, headless):
     if not failed:
         return
@@ -426,6 +493,7 @@ def _notify_registration_failures(failed, headless):
                 "registration_time": f.get("registration_time"),
                 "error": f.get("error"),
                 "traceback": f.get("traceback"),
+                "snapshots": ", ".join(f.get("snapshots") or []) or None,
             }
             notifier.send_notification(
                 subject="Event registration failed",
@@ -775,144 +843,262 @@ def check_for_new_event(headless=True, pending_open=None):
     deferred_reports = []  # Store report requests until all other emails are processed
 
     for email in new_emails:
-        # LAYER 1: Global authorization - sender must be in Google Contacts
-        # This is a first-pass filter to reject unknown senders before any processing
-        if email_client.is_sender_authorized(email.From):
-            logger.info(f"Authorized sender (in contacts): {email.From}")
-        else:
-            logger.info(f"Unauthorized sender (not in contacts): {email.From}")
-            email_client.mark_email_as_read(email)
-            email_client.archive_email(email)
-
-            continue
-
-        # Extract user tag from the To address (filter by system email to avoid mismatches)
+        # Reset per email so a failure handler never sees the previous email's tag.
+        user_tag = None
         try:
-            user_tag = extract_user_tag(email.To, system_email=email_client.user)
-        except ValueError as e:
-            # Missing system_email or other extraction error - treat as security event
-            logger.error(f"Failed to extract user tag: {e}")
-            email_client.mark_email_as_read(email)
-            email_client.archive_email(email)
-            continue
+            # LAYER 1: Global authorization - sender must be in Google Contacts
+            # This is a first-pass filter to reject unknown senders before any processing
+            if email_client.is_sender_authorized(email.From):
+                logger.info(f"Authorized sender (in contacts): {email.From}")
+            else:
+                logger.info(f"Unauthorized sender (not in contacts): {email.From}")
+                email_client.mark_email_as_read(email)
+                email_client.archive_email(email)
 
-        logger.info(f"Processing email for user tag: {user_tag}")
+                continue
 
-        # Validate user tag exists and is properly configured
-        try:
-            user_tag = validate_user_tag(user_tag)
-        except (ValueError, FileNotFoundError) as e:
-            logger.warning(f"Invalid user tag '{user_tag}': {e}")
-            # Silent archive to prevent user enumeration via response timing.
-            email_client.mark_email_as_read(email)
-            email_client.archive_email(email)
-            continue
-
-        # LAYER 2: User-specific authorization - sender must be authorized for this user_tag
-        # Even if sender passed global check (is in contacts), they must be explicitly
-        # authorized for the specific user account they're trying to access
-        sender_email = email_client.extract_email_address(email.From)[0]
-        if not is_sender_allowed(sender_email, user_tag):
-            logger.warning(
-                f"SECURITY: Unauthorized access attempt - sender '{sender_email}' "
-                f"tried to access user tag '{user_tag}'"
-            )
-            # Silent failure - do NOT reply to prevent confirmation of valid tags
-            email_client.mark_email_as_read(email)
-            email_client.archive_email(email)
-            continue
-
-        action, event_details = extract_user_intent(email)
-        event_date, time_range = event_details or (None, None)
-
-        if action == "report":
-            logger.info(
-                f"Deferring report for user '{user_tag}' until all other emails are processed."
-            )
-            deferred_reports.append((email, user_tag))
-            continue
-
-        elif action == "add":
-            logger.info(f"Adding event for user '{user_tag}': {event_date, time_range}")
-            if user_tag not in websites:
-                websites[user_tag] = Website(headless=headless)
-            website = websites[user_tag]
-            website.login(user_tag=user_tag)
-
+            # Extract user tag from the To address (filter by system email to avoid mismatches)
             try:
-                registration_time, additional_info = website.determine_access_date(
-                    event_date, time_range
-                )
-            except SkillLevelIneligible as e:
-                logger.info(
-                    f"Event not eligible for user '{user_tag}' due to skill level: {e}"
-                )
-                email_client.reply_to_email(email, str(e), user_tag=user_tag)
+                user_tag = extract_user_tag(email.To, system_email=email_client.user)
+            except ValueError as e:
+                # Missing system_email or other extraction error - treat as security event
+                logger.error(f"Failed to extract user tag: {e}")
                 email_client.mark_email_as_read(email)
                 email_client.archive_email(email)
                 continue
-            except EventNotFound:
-                logger.info(
-                    f"Event not listed for user '{user_tag}': {event_date} {time_range}; trying speculative."
+
+            logger.info(f"Processing email for user tag: {user_tag}")
+
+            # Validate user tag exists and is properly configured
+            try:
+                user_tag = validate_user_tag(user_tag)
+            except (ValueError, FileNotFoundError) as e:
+                logger.warning(f"Invalid user tag '{user_tag}': {e}")
+                # Silent archive to prevent user enumeration via response timing.
+                email_client.mark_email_as_read(email)
+                email_client.archive_email(email)
+                continue
+
+            # LAYER 2: User-specific authorization - sender must be authorized for this user_tag
+            # Even if sender passed global check (is in contacts), they must be explicitly
+            # authorized for the specific user account they're trying to access
+            sender_email = email_client.extract_email_address(email.From)[0]
+            if not is_sender_allowed(sender_email, user_tag):
+                logger.warning(
+                    f"SECURITY: Unauthorized access attempt - sender '{sender_email}' "
+                    f"tried to access user tag '{user_tag}'"
                 )
+                # Silent failure - do NOT reply to prevent confirmation of valid tags
+                email_client.mark_email_as_read(email)
+                email_client.archive_email(email)
+                continue
+
+            action, event_details = extract_user_intent(email)
+            event_date, time_range = event_details or (None, None)
+
+            if action == "report":
+                logger.info(
+                    f"Deferring report for user '{user_tag}' until all other emails are processed."
+                )
+                deferred_reports.append((email, user_tag))
+                continue
+
+            elif action == "add":
+                logger.info(f"Adding event for user '{user_tag}': {event_date, time_range}")
+                if user_tag not in websites:
+                    websites[user_tag] = Website(headless=headless)
+                website = websites[user_tag]
+                website.login(user_tag=user_tag)
+
                 try:
-                    reply, accepted = _handle_unlisted_request(
-                        events, website, email, user_tag, event_date, time_range,
-                        email_client=email_client,
+                    registration_time, additional_info = website.determine_access_date(
+                        event_date, time_range
                     )
-                except Exception:
-                    # Never let one request (e.g. a bad config value) stall the
-                    # whole inbox; it would be retried and fail every run.
-                    logger.exception("Speculative handling failed; replying not found.")
-                    reply = f"I couldn't find {event_date} {time_range} on the website."
-                    accepted = False
-                # An accepted speculative request isn't a failure, so only a
-                # rejected one is reported to the webmaster.
-                if APP_CONFIG["notify_webmaster_on_unlisted_request"] and not accepted:
+                except SkillLevelIneligible as e:
+                    logger.info(
+                        f"Event not eligible for user '{user_tag}' due to skill level: {e}"
+                    )
+                    email_client.reply_to_email(email, str(e), user_tag=user_tag)
+                    email_client.mark_email_as_read(email)
+                    email_client.archive_email(email)
+                    continue
+                except EventFull as e:
+                    logger.info(f"Event full for user '{user_tag}': {e}")
+                    email_client.reply_to_email(
+                        email,
+                        f"{event_date} {time_range} is already full, so I can't register you. "
+                        "You can join the waitlist on the website.",
+                        subject=f"Event Registration: {event_date} {time_range}",
+                        user_tag=user_tag,
+                    )
+                    email_client.mark_email_as_read(email)
+                    email_client.archive_email(email)
+                    continue
+                except EventNotFound:
+                    logger.info(
+                        f"Event not listed for user '{user_tag}': {event_date} {time_range}; trying speculative."
+                    )
                     try:
-                        email_client.send_notification(
+                        reply, accepted = _handle_unlisted_request(
+                            events, website, email, user_tag, event_date, time_range,
+                            email_client=email_client,
+                        )
+                    except Exception:
+                        # Never let one request (e.g. a bad config value) stall the
+                        # whole inbox; it would be retried and fail every run.
+                        logger.exception("Speculative handling failed; replying not found.")
+                        reply = f"I couldn't find {event_date} {time_range} on the website."
+                        accepted = False
+                    # An accepted speculative request isn't a failure, so only a
+                    # rejected one is reported to the webmaster.
+                    if APP_CONFIG["notify_webmaster_on_unlisted_request"] and not accepted:
+                        try:
+                            email_client.send_notification(
+                                subject="Event registration failed",
+                                body=_format_failure_body(
+                                    {
+                                        "user_tag": user_tag,
+                                        "event_date": event_date,
+                                        "time_range": time_range,
+                                        "reason": "event not listed on the website",
+                                        "reply": reply,
+                                    },
+                                    headless_flag=headless,
+                                ),
+                                user_tag=user_tag,
+                            )
+                        except Exception:
+                            logger.exception("Failed to send webmaster notification for unlisted request")
+                    email_client.reply_to_email(
+                        email,
+                        reply,
+                        subject=f"Event Registration: {event_date} {time_range}",
+                        user_tag=user_tag,
+                    )
+                    email_client.mark_email_as_read(email)
+                    email_client.archive_email(email)
+                    continue
+
+                _record_details_rows(events, website, user_tag)
+
+                if registration_time is None:
+                    logger.info(
+                        f"Could not determine the registration time for {event_date, time_range}."
+                    )
+                    reply = "I could not determine the registration time."
+                    if additional_info:
+                        reply += f"\n\nI found this info on the page (check if you are in an eligible tier): {additional_info}"
+
+                    email_client.reply_to_email(email, reply, user_tag=user_tag)
+                    try:
+                        notifier = EmailClient()
+                        ctx = {
+                            "user_tag": user_tag,
+                            "event_date": event_date,
+                            "time_range": time_range,
+                            "reason": "could not determine registration time",
+                            "additional_info": additional_info,
+                        }
+                        notifier.send_notification(
                             subject="Event registration failed",
-                            body=_format_failure_body(
-                                {
-                                    "user_tag": user_tag,
-                                    "event_date": event_date,
-                                    "time_range": time_range,
-                                    "reason": "event not listed on the website",
-                                    "reply": reply,
-                                },
-                                headless_flag=headless,
-                            ),
+                            body=_format_failure_body(ctx, headless_flag=headless),
                             user_tag=user_tag,
                         )
                     except Exception:
-                        logger.exception("Failed to send webmaster notification for unlisted request")
+                        logger.exception(
+                            "Failed to send failure notification for undetermined registration time"
+                        )
+                elif not _supersede_existing_row(events, event_date, time_range, user_tag):
+                    email_client.reply_to_email(
+                        email,
+                        f"I'm already registering for {event_date} {time_range} right now. "
+                        "I'll email you the result.",
+                        subject=f"Event Registration: {event_date} {time_range}",
+                        user_tag=user_tag,
+                    )
+                elif registration_time <= datetime.now() + ALREADY_OPEN_MARGIN:
+                    # determine_access_date returns "now" when the event is already
+                    # open. Storing that (or a time seconds away, which slips into
+                    # the past while later emails are processed) would never
+                    # register: the scheduler only picks up future times. Queue it;
+                    # the email is marked read below, before any registration.
+                    logger.info(
+                        f"Registration open or about to open for user '{user_tag}': "
+                        f"{event_date} {time_range}; queued."
+                    )
+                    pending_open.append(
+                        {
+                            "email": email,
+                            "user_tag": user_tag,
+                            "event_date": event_date,
+                            "time_range": time_range,
+                            "additional_info": additional_info,
+                            "registration_time": registration_time,
+                        }
+                    )
+                else:
+                    logger.debug(
+                        f"Inserting {event_date, time_range} into database at {registration_time} for user '{user_tag}'"
+                    )
+                    # An explicit add replaces the user's other events at the same
+                    # registration time (confirmed or speculative), never one that's
+                    # being registered right now.
+                    _displace_rows(
+                        events, email_client, user_tag, registration_time, (event_date, time_range),
+                        {"confirmed", "speculative"},
+                    )
+                    events.insert_event(
+                        event_date=event_date,
+                        time_range=time_range,
+                        registration_time=registration_time,
+                        user_tag=user_tag,
+                        additional_info=additional_info,
+                    )
+
+                    reply = f"I determined I need to register at {registration_time} and will do so."
+
+                    if additional_info:
+                        reply += f"\n\nAdditional info: {additional_info}"
+
+                    reply_html = textile.textile(reply)
+
+                    email_client.reply_to_email(
+                        email,
+                        reply_plaintext=reply,
+                        reply_html=reply_html,
+                        subject=f"Event Registration Confirmation: {event_date} {time_range}",
+                        user_tag=user_tag,
+                    )
+
+                    logger.info(
+                        f"Inserted and emailed {event_date} {time_range} into database at {registration_time} for user '{user_tag}' with additional info: {additional_info}"
+                    )
+
+            elif action == "remove":
+                logger.info(
+                    f"Removing event for user '{user_tag}': {event_date, time_range}"
+                )
+                events.remove_event(event_date, time_range, user_tag=user_tag)
                 email_client.reply_to_email(
                     email,
-                    reply,
-                    subject=f"Event Registration: {event_date} {time_range}",
+                    "I am not going to register for the event.",
+                    subject=f"Event Registration Cancellation: {event_date} {time_range}",
                     user_tag=user_tag,
                 )
-                email_client.mark_email_as_read(email)
-                email_client.archive_email(email)
-                continue
 
-            if registration_time is None:
-                logger.info(
-                    f"Could not determine the registration time for {event_date, time_range}."
+            elif action is None:
+                logger.info("Could not determine the action from the email.")
+                email_client.reply_to_email(
+                    email, "I am not sure what you want me to do.", user_tag=user_tag
                 )
-                reply = "I could not determine the registration time."
-                if additional_info:
-                    reply += f"\n\nI found this info on the page (check if you are in an eligible tier): {additional_info}"
-
-                email_client.reply_to_email(email, reply, user_tag=user_tag)
                 try:
                     notifier = EmailClient()
                     ctx = {
                         "user_tag": user_tag,
-                        "event_date": event_date,
-                        "time_range": time_range,
-                        "reason": "could not determine registration time",
-                        "additional_info": additional_info,
+                        "email_from": email.From,
+                        "email_subject": email.subject,
+                        "reason": "could not determine action",
+                        "email_body": email.body,
                     }
                     notifier.send_notification(
                         subject="Event registration failed",
@@ -921,112 +1107,15 @@ def check_for_new_event(headless=True, pending_open=None):
                     )
                 except Exception:
                     logger.exception(
-                        "Failed to send failure notification for undetermined registration time"
+                        "Failed to send failure notification for unknown action"
                     )
-            elif not _supersede_existing_row(events, event_date, time_range, user_tag):
-                email_client.reply_to_email(
-                    email,
-                    f"I'm already registering for {event_date} {time_range} right now. "
-                    "I'll email you the result.",
-                    subject=f"Event Registration: {event_date} {time_range}",
-                    user_tag=user_tag,
-                )
-            elif registration_time <= datetime.now() + ALREADY_OPEN_MARGIN:
-                # determine_access_date returns "now" when the event is already
-                # open. Storing that (or a time seconds away, which slips into
-                # the past while later emails are processed) would never
-                # register: the scheduler only picks up future times. Queue it;
-                # the email is marked read below, before any registration.
-                logger.info(
-                    f"Registration open or about to open for user '{user_tag}': "
-                    f"{event_date} {time_range}; queued."
-                )
-                pending_open.append(
-                    {
-                        "email": email,
-                        "user_tag": user_tag,
-                        "event_date": event_date,
-                        "time_range": time_range,
-                        "additional_info": additional_info,
-                        "registration_time": registration_time,
-                    }
-                )
-            else:
-                logger.debug(
-                    f"Inserting {event_date, time_range} into database at {registration_time} for user '{user_tag}'"
-                )
-                # An explicit add replaces the user's other events at the same
-                # registration time (confirmed or speculative), never one that's
-                # being registered right now.
-                _displace_rows(
-                    events, email_client, user_tag, registration_time, (event_date, time_range),
-                    {"confirmed", "speculative"},
-                )
-                events.insert_event(
-                    event_date=event_date,
-                    time_range=time_range,
-                    registration_time=registration_time,
-                    user_tag=user_tag,
-                    additional_info=additional_info,
-                )
 
-                reply = f"I determined I need to register at {registration_time} and will do so."
-
-                if additional_info:
-                    reply += f"\n\nAdditional info: {additional_info}"
-
-                reply_html = textile.textile(reply)
-
-                email_client.reply_to_email(
-                    email,
-                    reply_plaintext=reply,
-                    reply_html=reply_html,
-                    subject=f"Event Registration Confirmation: {event_date} {time_range}",
-                    user_tag=user_tag,
-                )
-
-                logger.info(
-                    f"Inserted and emailed {event_date} {time_range} into database at {registration_time} for user '{user_tag}' with additional info: {additional_info}"
-                )
-
-        elif action == "remove":
-            logger.info(
-                f"Removing event for user '{user_tag}': {event_date, time_range}"
-            )
-            events.remove_event(event_date, time_range, user_tag=user_tag)
-            email_client.reply_to_email(
-                email,
-                "I am not going to register for the event.",
-                subject=f"Event Registration Cancellation: {event_date} {time_range}",
-                user_tag=user_tag,
-            )
-
-        elif action is None:
-            logger.info("Could not determine the action from the email.")
-            email_client.reply_to_email(
-                email, "I am not sure what you want me to do.", user_tag=user_tag
-            )
-            try:
-                notifier = EmailClient()
-                ctx = {
-                    "user_tag": user_tag,
-                    "email_from": email.From,
-                    "email_subject": email.subject,
-                    "reason": "could not determine action",
-                    "email_body": email.body,
-                }
-                notifier.send_notification(
-                    subject="Event registration failed",
-                    body=_format_failure_body(ctx, headless_flag=headless),
-                    user_tag=user_tag,
-                )
-            except Exception:
-                logger.exception(
-                    "Failed to send failure notification for unknown action"
-                )
-
-        email_client.mark_email_as_read(email)
-        email_client.archive_email(email)
+            email_client.mark_email_as_read(email)
+            email_client.archive_email(email)
+        except Exception as e:
+            # One failing request (e.g. the site not rendering) must not stall
+            # the inbox: the email would stay unread and fail every run.
+            _handle_email_failure(email_client, email, websites, user_tag, e, headless)
 
     # Process deferred report requests now that all add/remove actions are complete
     for report_email, report_user_tag in deferred_reports:
@@ -1076,15 +1165,24 @@ def _check_speculative_row(events, website, email_client, row, now, executor, he
     """Looks for one speculative event on the site and acts on what it finds.
 
     If it should be registered this run, claims it, starts the registration on
-    `executor`, and returns (row, item, future); otherwise returns None.
+    `executor`, and returns (row, item, future); otherwise returns None. Every
+    path logs one "Speculative check" line with the decision and why, so a
+    row's history can be followed with a single grep.
     """
     event_date, time_range, user_tag = row["event_date"], row["time_range"], row["user_tag"]
     label = f"{event_date} {time_range}"
 
+    def decide(decision, reason):
+        logger.info(
+            f"Speculative check {label} for '{user_tag}': {decision} - {reason} "
+            f"(predicted opening {row['registration_time']}, expected day {row['expected_event_day']})"
+        )
+
     # The due list was read when the refresh started, possibly minutes ago:
     # skip rows another run claimed or resolved, or that were removed since.
-    if events.get_status(event_date, time_range, user_tag) != "speculative":
-        logger.info(f"Skipping {label} for '{user_tag}': no longer speculative.")
+    status = events.get_status(event_date, time_range, user_tag)
+    if status != "speculative":
+        decide("skip", f"status is now {status!r}")
         return None
 
     expected_day = row["expected_event_day"]
@@ -1097,10 +1195,18 @@ def _check_speculative_row(events, website, email_client, row, now, executor, he
     try:
         registration_time, additional_info = website.determine_access_date(event_date, time_range)
     except SkillLevelIneligible as e:
-        logger.info(f"Speculative event {label} for '{user_tag}' is skill-ineligible: {e}")
+        decide("drop", f"skill-ineligible: {e}")
         _drop_speculative(events, email_client, row, str(e))
         return None
-    except EventNotFound:
+    except EventFull as e:
+        decide("drop", f"posted but already full: {e}")
+        _drop_speculative(
+            events, email_client, row,
+            f"The {label} session is posted but already full, so I couldn't register you. "
+            "You can join the waitlist on the website.",
+        )
+        return None
+    except EventNotFound as e:
         parsed = schedule.parse_request(event_date, time_range, now.date())
         skipped = bool(
             expected_day
@@ -1110,6 +1216,12 @@ def _check_speculative_row(events, website, email_client, row, now, executor, he
             )
         )
         if skipped or event_over or (event_day_reached and opening_passed):
+            reason = (
+                "a later week of the slot is listed" if skipped
+                else "event day has passed" if event_over
+                else "event day reached and predicted opening passed"
+            )
+            decide("drop", f"not posted ({e}); {reason}")
             _drop_speculative(
                 events,
                 email_client,
@@ -1118,12 +1230,15 @@ def _check_speculative_row(events, website, email_client, row, now, executor, he
                 f"skipped this week), so I won't register for it.",
             )
         else:
-            logger.info(f"Speculative event {label} for '{user_tag}' not posted yet.")
+            decide("wait", f"not posted yet ({e})")
             events.mark_checked(event_date, time_range, user_tag, when=now)
         return None
 
+    _record_details_rows(events, website, user_tag)
+
     if registration_time is None:
         if event_day_reached:
+            decide("drop", "posted but registration time unreadable; event day reached")
             _drop_speculative(
                 events,
                 email_client,
@@ -1132,14 +1247,12 @@ def _check_speculative_row(events, website, email_client, row, now, executor, he
                 "so I couldn't register for it. Please check the website.",
             )
         else:
-            logger.warning(
-                f"Speculative event {label} for '{user_tag}' is posted but its registration time "
-                "couldn't be read; keeping the prediction."
-            )
+            decide("wait", "posted but registration time unreadable; keeping prediction")
             events.mark_checked(event_date, time_range, user_tag, when=now)
         return None
 
     if not _take_slot_for_speculative(events, email_client, row, registration_time):
+        decide("drop", f"another booking already holds {registration_time}")
         return None
 
     # register_for_next_event already ran this cron cycle; anything opening
@@ -1147,7 +1260,7 @@ def _check_speculative_row(events, website, email_client, row, now, executor, he
     next_run = datetime.now() + timedelta(minutes=APP_CONFIG["cron_interval_minutes"])
     if registration_time <= next_run:
         if not events.claim(event_date, time_range, user_tag):
-            logger.info(f"Skipping {label} for '{user_tag}': claimed by another run.")
+            decide("skip", "claimed by another run")
             return None
         item = {
             "event_date": event_date,
@@ -1156,13 +1269,15 @@ def _check_speculative_row(events, website, email_client, row, now, executor, he
             "registration_time": registration_time,
             "additional_info": additional_info,
         }
-        logger.info(f"Registering {label} for '{user_tag}' this run (opens {registration_time}).")
+        decide("register now", f"posted; opens {registration_time}, before the next run")
         return row, item, _submit_registration(executor, item, headless)
 
     if not events.confirm_event(
         event_date, time_range, user_tag, registration_time, additional_info, expected="speculative"
     ):
+        decide("skip", "changed by another run before confirming")
         return None
+    decide("confirm", f"posted; registration opens {registration_time}")
     reply = (
         f"The {label} session is now posted. Registration opens at {registration_time} "
         "and I'll register then."
@@ -1324,6 +1439,7 @@ def _refresh_schedule_and_confirm_speculative(headless):
                         logger.exception(
                             f"Failed to check speculative event {row['event_date']} {row['time_range']} for '{tag}'"
                         )
+                        _capture_failure(website, f"speculative_check_{tag}")
             except Exception:
                 logger.exception(f"Failed to refresh schedule for user '{tag}'")
             finally:

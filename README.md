@@ -126,7 +126,15 @@ Send an email to the system's Gmail address (with optional plus-tag for user rou
 - **Remove event**: Include "stop", "cancel", or "remove" in the body along with the event details.
 - **Report**: Use "report" in the subject to receive a list of scheduled events.
 
+Each email is handled on its own. If one fails unexpectedly (for example the site doesn't load), the sender gets a reply saying so, the webmaster is notified with a page snapshot, and the email is marked read so it doesn't block the others. A session that's already full gets a polite reply instead of a registration attempt.
+
+### How sessions are found
+
+The booking site's events list shows one card per recurring series, with that series' next date. The bot finds a requested date by matching the series' weekday and time, then opening the series' details page (via "View upcoming dates"), which lists every upcoming date with its own "registration opens in …" countdown. That countdown, moved onto `default_registration_time`, is the registration time. Registering clicks the details page's Register button for that date and then confirms it went through (the button changes to "Edit Registration" or the site shows a confirmation); if it can't confirm, it reports a failure rather than assuming success.
+
 ### Speculative Pre-Registration
+
+Because a series' details page lists its dates weeks ahead, most requests for future weeks are found directly. Speculative handling is for sessions not on the website at all yet.
 
 If you ask for a session that isn't on the website yet, the system checks whether the same weekday and time slot has been listed in recent weeks (at least `speculative_min_matches` times in the last `speculative_lookback_weeks` weeks). If so, it accepts the request as **speculative**:
 
@@ -141,6 +149,12 @@ If you ask for a session that isn't on the website yet, the system checks whethe
 The schedule history is built by scanning each user's events list every `snapshot_interval_hours`. A failed scan also waits that long before it's retried. There is no backfill, so for the first few weeks matches come mostly from sessions currently listed. Token files must have lowercase names (for example `user_tokens/alice.json`) to be scanned.
 
 The recheck step uses a `refresh.lock` file so overlapping cron runs don't run it twice; a lock older than `speculative_claim_stale_minutes` is treated as left over from a crashed run.
+
+### Troubleshooting
+
+- **Page snapshots:** whenever a browser step fails, a screenshot and the page HTML are saved to `logs/failures/` (kept for 14 days), and their paths are included in the log and the failure email.
+- **Speculative requests:** every check of a speculative request logs one line starting `Speculative check`, with the decision (`wait`, `confirm`, `register now`, `drop`, `skip`), the reason, the predicted opening, and the expected day. To follow one request: `grep "Speculative check Mon, Nov 9th" logs/*.txt`.
+- **Timeouts** name what was being waited for and the page URL, e.g. `Timed out after 30s waiting for the events list (url=… title=…)`.
 
 ## Example
 

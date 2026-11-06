@@ -7,7 +7,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
-from website import _parse_month_day, _parse_time_range, parse_clock
+from website import _parse_month_day, _parse_time_range, parse_clock, resolve_year
 from logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -25,25 +25,6 @@ class Prediction:
 @dataclass
 class Rejection:
     reason: str
-
-
-def resolve_year(month, day, today):
-    """Site and user dates carry no year; pick the one closest to today."""
-    candidates = []
-    for year in (today.year - 1, today.year, today.year + 1):
-        try:
-            candidates.append(date(year, month, day))
-        except ValueError:
-            continue  # Feb 29 outside a leap year
-    if not candidates:
-        # Only Feb 29 can get here; the nearest leap year may be further out.
-        year = today.year + 1
-        while True:
-            try:
-                return date(year, month, day)
-            except ValueError:
-                year += 1
-    return min(candidates, key=lambda d: abs((d - today).days))
 
 
 def hm_pair(time_tuple):
