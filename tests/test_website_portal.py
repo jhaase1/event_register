@@ -507,7 +507,8 @@ def _header_resets_after_signup(finalize_navigates):
 
 
 def test_unverified_message_says_the_signup_page_was_left():
-    site, _series = _header_resets_after_signup(finalize_navigates=True)
+    site, series = _header_resets_after_signup(finalize_navigates=True)
+    series[0].registered_markup = False
 
     with pytest.raises(website.RegistrationUnverified) as error:
         site.register_for_event(req(D2), "11a - 1p", _details_url("SERIES101"))
@@ -516,7 +517,8 @@ def test_unverified_message_says_the_signup_page_was_left():
 
 
 def test_unfinished_signup_that_cannot_be_checked_is_a_plain_failure():
-    site, _series = _header_resets_after_signup(finalize_navigates=False)
+    site, series = _header_resets_after_signup(finalize_navigates=False)
+    series[0].registered_markup = False
 
     with pytest.raises(website.RegistrationError) as error:
         site.register_for_event(req(D2), "11a - 1p", _details_url("SERIES101"))
@@ -550,6 +552,7 @@ def test_verification_that_cannot_reselect_the_date_is_unverified_not_failed():
     series[0].rows[1].state = "open"
     series[0].default_row = 1  # the page opens on D2...
     series[0].finalize_navigates = True
+    series[0].registered_markup = False  # no row tag to fall back on
     site, fake = make_site(series)
     real_get = fake.get
 
@@ -1097,6 +1100,7 @@ def test_unrecognized_label_after_finalize_is_unverified():
     series = standard_series()
     plain_label = series[0].row_label
     series[0].row_label = lambda r: "Manage" if r.registered else plain_label(r)
+    series[0].registered_markup = False
     site, _fake = make_site(series)
 
     with pytest.raises(website.RegistrationUnverified) as error:
@@ -1178,3 +1182,46 @@ def test_enabled_finalize_button_wins_over_stray_not_eligible_text():
     site.register_for_event(req(D1), "11a - 1p", _details_url("SERIES101"))
 
     assert series[0].rows[0].registered is True
+
+
+# --- registered markup seen on the live site (Nov 7 2026) ---------------------
+
+
+def test_registration_is_confirmed_by_edit_registration_and_withdraw_buttons():
+    # After a real registration the site shows Edit Registration + Withdraw
+    # and no Register button; this was misreported as "no button" on Nov 7.
+    series = standard_series()
+    site, fake = make_site(series)
+
+    site.register_for_event(req(D1), "11a - 1p", _details_url("SERIES101"))
+
+    assert series[0].rows[0].registered is True
+    assert site._details_button_label() == "edit registration"
+
+
+def test_registered_row_tag_confirms_even_when_header_shows_another_date():
+    site, series = _header_resets_after_signup(finalize_navigates=True)
+
+    site.register_for_event(req(D2), "11a - 1p", _details_url("SERIES101"))
+
+    assert series[0].rows[1].registered is True
+
+
+def test_already_registered_date_is_not_registered_again():
+    series = standard_series()
+    series[0].rows[1].state = "open"
+    series[0].rows[1].registered = True  # header (D1) is not the registered date
+    site, fake = make_site(series)
+
+    site.register_for_event(req(D2), "11a - 1p", _details_url("SERIES101"))
+
+    assert not any("SignUpToEvent" in url for url in fake.gets)
+
+
+def test_details_rows_report_the_registered_tag():
+    series = standard_series()
+    series[0].rows[2].registered = True
+    site, fake = make_site(series)
+    fake.get(_details_url("SERIES101"))
+
+    assert [r["registered"] for r in site._details_rows()] == [False, False, True]

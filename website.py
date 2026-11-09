@@ -87,6 +87,10 @@ DETAILS_SLOTS = _testid("events-details-slots")
 DETAILS_SIGNUP_MESSAGE = _testid("events-details-signup-message")
 # data-testid holds several space-separated values here, hence ~=.
 DETAILS_REGISTER_BTN = "[data-testid~='events-details-register-btn']"
+# Once registered, the Register button is replaced by these two (live site,
+# Nov 2026), and the date's row gets a "Registered" tag.
+DETAILS_EDIT_REGISTRATION_BTN = "[data-testid~='events-details-edit-registration-btn']"
+DETAILS_WITHDRAW_BTN = "[data-testid~='events-details-withdraw-btn']"
 DETAILS_RESTRICTION = "[data-testid^='events-details-side-restriction-']"
 DETAILS_ROW_PREFIX = "events-details-date-row-"
 DETAILS_ROW_ID_RE = re.compile(rf"^{DETAILS_ROW_PREFIX}(\d+)$")
@@ -110,6 +114,10 @@ def DETAILS_ROW_SLOTS(index):
 
 def DETAILS_ROW_NOT_OPEN(index):
     return _testid(f"events-details-date-not-open-{index}")
+
+
+def DETAILS_ROW_REGISTERED(index):
+    return _testid(f"events-details-date-registered-{index}")
 
 
 # Button labels (lowercased) on list cards and the details page.
@@ -671,9 +679,12 @@ class Website:
         try:
             self._wait(
                 EC.presence_of_element_located(
-                    (By.CSS_SELECTOR, f"{DETAILS_REGISTER_BTN}, {DETAILS_SIGNUP_MESSAGE}")
+                    (
+                        By.CSS_SELECTOR,
+                        f"{DETAILS_REGISTER_BTN}, {DETAILS_SIGNUP_MESSAGE}, {DETAILS_EDIT_REGISTRATION_BTN}",
+                    )
                 ),
-                "the details page's Register button or signup message",
+                "the details page's Register/Edit Registration button or signup message",
                 timeout=hydrate,
             )
         except TimeoutException as e:
@@ -701,9 +712,23 @@ class Website:
                     "slots": self._text(DETAILS_ROW_SLOTS(index)),
                     "not_open": not_open,
                     "opens_in": _parse_opens_in(not_open) if not_open else None,
+                    "registered": bool(
+                        self.driver.find_elements(By.CSS_SELECTOR, DETAILS_ROW_REGISTERED(index))
+                    ),
                 }
             )
         return rows
+
+    def _row_registered(self, event_date, time_range):
+        """Whether the requested date's row carries the "Registered" tag. Read
+        per row, so it doesn't depend on which date the header shows."""
+        target = _parse_month_day(event_date or "")
+        query_time = _parse_time_range(time_range or "")
+        return any(
+            row["registered"]
+            for row in self._details_rows()
+            if row["month_day"] == target and row["time"] in (None, query_time)
+        )
 
     def _details_restriction(self):
         """Skill restriction text such as 'Intermediate, Advanced', or None."""
@@ -983,7 +1008,14 @@ class Website:
         return _parse_month_day(self._text(DETAILS_HEADER_DATE) or "")
 
     def _details_button_label(self):
-        return (self._text(DETAILS_REGISTER_BTN) or "").lower()
+        label = (self._text(DETAILS_REGISTER_BTN) or "").lower()
+        if not label and self.driver.find_elements(
+            By.CSS_SELECTOR, f"{DETAILS_EDIT_REGISTRATION_BTN}, {DETAILS_WITHDRAW_BTN}"
+        ):
+            # The header date is already registered: the site shows Edit
+            # Registration / Withdraw instead of a Register button.
+            return "edit registration"
+        return label
 
     def _select_date(self, event_date, time_range):
         """Makes sure the details page header shows the requested date, since
@@ -1025,6 +1057,9 @@ class Website:
         else:
             event_url, _row, _card = self._find_occurrence(event_date, time_range)
 
+        if self._row_registered(event_date, time_range):
+            logger.info(f"Already registered for {event_date} {time_range} (date marked Registered).")
+            return
         self._select_date(event_date, time_range)
         details_url = self.driver.current_url
         self._check_restriction()
@@ -1226,6 +1261,10 @@ class Website:
         `outcome` is (left the signup page, description) from _finalize_signup."""
         self._get_with_retry(details_url)
         self._wait_for_details_page()
+        # The date's own "Registered" tag is the most direct proof and works
+        # whichever date the header shows.
+        if self._row_registered(event_date, time_range):
+            return
         try:
             self._select_date(event_date, time_range)
         except RegistrationError:

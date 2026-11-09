@@ -133,6 +133,9 @@ class Series:
         self.selected = 0
         self.row_click_selects = False
         self.finalize_navigates = False
+        # False: render a registered date without the live site's markup (no
+        # row tag; Register button relabelled) - for testing fallback checks.
+        self.registered_markup = True
         self.register_click_error = None  # raised by a native click on Register
         # Renders of the signup page before its date header shows up.
         self.signup_date_delay_renders = 0
@@ -339,12 +342,16 @@ class FakePortal:
                 if row.state == "not_open"
                 else El(testid=f"events-details-date-row-slots-{i}", text="FULL" if row.state == "full" else row.slots)
             )
-            rows.append(El(testid=f"events-details-date-row-{i}", on_click=select, children=[
+            row_children = [
                 El(testid=f"events-details-date-row-date-{i}",
                    text=f"{row.weekday}\n{row.day}\n{MONTH_ABBR[row.month]}"),
                 El(testid=f"events-details-date-row-time-{i}", text=row.time_text),
-                status,
-            ]))
+            ]
+            if row.registered and s.registered_markup:
+                # Live site (Nov 2026): a green "Registered" tag next to the time.
+                row_children.append(El(testid=f"events-details-date-registered-{i}", text="Registered"))
+            row_children.append(status)
+            rows.append(El(testid=f"events-details-date-row-{i}", on_click=select, children=row_children))
 
         def register(series=s):
             # Like the live site: Register only opens the signup page.
@@ -361,6 +368,13 @@ class FakePortal:
         if selected.state == "not_open":
             children.append(El(testid="events-details-signup-message",
                                text=selected.opens_in.replace("Single date registration", "Registration")))
+        elif selected.registered and s.registered_markup:
+            # Live site (Nov 2026): Register is replaced by these two buttons.
+            children.append(El(testid="events-details-action-btns", children=[
+                El(testid="events-details-edit-registration-btn edit-registration-btn",
+                   text="Edit Registration", tag="button"),
+                El(testid="events-details-withdraw-btn withdraw-btn", text="Withdraw", tag="button"),
+            ]))
         else:
             children.append(El(
                 testid="events-details-register-btn events-details-register-single-btn register-btn",
