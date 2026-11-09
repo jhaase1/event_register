@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import events as events_module
 import main
 from events import Events
 
@@ -1519,6 +1520,10 @@ def test_default_poll_schedule_starts_before_opening_and_keeps_looking_for_a_min
 
 class _SnapshottingWebsite(FakeWebsite):
     snapshots_taken = []
+    closed = False
+
+    def close(self):
+        self.closed = True
 
     def capture_failure(self, label):
         _SnapshottingWebsite.snapshots_taken.append(label)
@@ -1531,7 +1536,7 @@ def _two_emails():
     return first, second
 
 
-def test_one_failing_email_does_not_block_the_rest_of_the_inbox(monkeypatch, db_path, fake_site):
+def _wire_first_email_browser_error(monkeypatch, fake_site):
     _SnapshottingWebsite.snapshots_taken = []
     first, second = _two_emails()
     client = FakeEmailClient(emails=[first, second])
@@ -1553,10 +1558,43 @@ def test_one_failing_email_does_not_block_the_rest_of_the_inbox(monkeypatch, db_
         return later, "info"
 
     fake_site.outcome = outcome  # FakeWebsite reads its own class attribute
+    return client
+
+
+def test_browser_error_leaves_the_email_for_the_next_run(monkeypatch, db_path, fake_site):
+    client = _wire_first_email_browser_error(monkeypatch, fake_site)
 
     main.check_for_new_event(headless=True)
 
-    # Both emails handled and taken out of the inbox.
+    # The failing email stays unread and unanswered; the next one is handled.
+    assert client.archived_ids == ["msg-2"]
+    assert client.marked_read_ids == ["msg-2"]
+    assert [r.email.id for r in client.replies] == ["msg-2"]
+    assert client.notifications == []
+    db = _open(db_path)
+    assert db.get_email_failures("msg-1") == 1
+    db.close()
+
+
+def test_browser_error_gets_a_fresh_browser_for_the_next_email(monkeypatch, db_path, fake_site):
+    _wire_first_email_browser_error(monkeypatch, fake_site)
+
+    main.check_for_new_event(headless=True)
+
+    assert len(fake_site.instances) == 2
+    assert fake_site.instances[0].closed
+
+
+def test_one_failing_email_does_not_block_the_rest_of_the_inbox(monkeypatch, db_path, fake_site):
+    client = _wire_first_email_browser_error(monkeypatch, fake_site)
+    db = _open(db_path)
+    for _ in range(main.EMAIL_FAILURE_LIMIT - 1):
+        db.bump_email_failures("msg-1")
+    db.close()
+
+    main.check_for_new_event(headless=True)
+
+    # On the last allowed attempt both emails are handled and taken out of the inbox.
     assert client.archived_ids == ["msg-1", "msg-2"]
     assert client.marked_read_ids == ["msg-1", "msg-2"]
     bodies = {r.email.id: r.body for r in client.replies}
@@ -1566,6 +1604,64 @@ def test_one_failing_email_does_not_block_the_rest_of_the_inbox(monkeypatch, db_
     assert len(client.notifications) == 1
     assert "logs/failures/email_default.png" in client.notifications[0][1]
     assert _SnapshottingWebsite.snapshots_taken == ["email_default"]
+    db = _open(db_path)
+    assert db.get_email_failures("msg-1") == 0
+    db.close()
+
+
+def test_successfully_handled_email_clears_its_failure_count(monkeypatch, db_path, fake_site):
+    db = _open(db_path)
+    db.bump_email_failures("msg-1")
+    db.close()
+    fake_site.outcome = lambda *_a: (datetime.now() + timedelta(days=2), "info")
+    _wire_email_flow(monkeypatch, _make_email("x"))
+
+    main.check_for_new_event(headless=True)
+
+    db = _open(db_path)
+    assert db.get_email_failures("msg-1") == 0
+    db.close()
+
+
+def test_non_browser_error_after_authorization_is_reported_at_once(monkeypatch, db_path, fake_site):
+    def broken(*_a):
+        raise KeyError("bad page data")
+
+    fake_site.outcome = broken
+    client = _wire_email_flow(monkeypatch, _make_email("x"))
+
+    main.check_for_new_event(headless=True)
+
+    assert "Something went wrong" in client.replies[0].body
+    assert len(client.notifications) == 1
+    assert client.archived_ids == ["msg-1"]
+
+
+@pytest.mark.parametrize("stage", ["contacts", "extract_tag", "validate_tag", "sender_allowed"])
+def test_errors_before_authorization_never_reply(monkeypatch, db_path, fake_site, stage):
+    client = _wire_email_flow(monkeypatch, _make_email("x"))
+
+    def boom(*_a, **_k):
+        raise RuntimeError(f"{stage} lookup failed")
+
+    if stage == "contacts":
+        client.is_sender_authorized = boom
+    else:
+        target = {"extract_tag": "extract_user_tag", "validate_tag": "validate_user_tag",
+                  "sender_allowed": "is_sender_allowed"}[stage]
+        monkeypatch.setattr(main, target, boom)
+
+    # Retried (left unread) until the limit, then silently archived.
+    for run in range(1, main.EMAIL_FAILURE_LIMIT + 1):
+        main.check_for_new_event(headless=True)
+        if run < main.EMAIL_FAILURE_LIMIT:
+            assert client.archived_ids == [] and client.notifications == []
+
+    assert client.replies == []
+    assert client.marked_read_ids == ["msg-1"]
+    assert client.archived_ids == ["msg-1"]
+    assert len(client.notifications) == 1
+    assert "before the sender was authorized" in client.notifications[0][1]
 
 
 def test_full_session_gets_a_polite_reply_without_webmaster_mail(monkeypatch, db_path, fake_site):
@@ -1661,3 +1757,427 @@ def test_every_speculative_check_logs_one_decision_line(refresh_env, caplog, out
     assert len(lines) == 1
     assert f": {decision} - " in lines[0]
     assert "predicted opening" in lines[0]
+
+
+# --- review round: list reload, unverified and not-open registrations --------
+
+
+class _ListReloadingSite(FakeWebsite):
+    """Like the real site: the lookup leaves the browser on a details page."""
+
+    def determine_access_date(self, event_date, time_range):
+        self.on_list = False
+        return super().determine_access_date(event_date, time_range)
+
+    def display_all_events(self):
+        super().display_all_events()
+        self.on_list = True
+
+    def scan_listed_events(self):
+        return super().scan_listed_events() if self.on_list else []
+
+
+def _seed_pattern(db_path):
+    seed = _open(db_path)
+    seed.upsert_observations(
+        "default",
+        [_obs(REQUESTED_DAY - timedelta(days=21)), _obs(REQUESTED_DAY - timedelta(days=14))],
+        seen_at=datetime.now(),
+    )
+    seed.close()
+
+
+def test_unlisted_request_reloads_the_list_before_recording_it(monkeypatch, db_path, fake_site):
+    _seed_pattern(db_path)
+    monkeypatch.setattr(main, "Website", _ListReloadingSite)
+    fake_site.cards = [_card(REQUESTED_DAY - timedelta(days=7), opens_in=timedelta(hours=1))]
+    fake_site.outcome = _not_found
+    _wire_email_flow(monkeypatch, _make_email("x"))
+
+    main.check_for_new_event(headless=True)
+
+    db = _open(db_path)
+    seen = [o["event_day"] for o in db.get_observations("default", since=TODAY)]
+    db.close()
+    assert REQUESTED_DAY - timedelta(days=7) in seen
+
+
+def test_unlisted_request_still_scheduled_when_the_list_reload_fails(monkeypatch, db_path, fake_site):
+    _seed_pattern(db_path)
+
+    class ReloadFails(FakeWebsite):
+        def display_all_events(self):
+            raise main.WebDriverException("list timed out")
+
+    monkeypatch.setattr(main, "Website", ReloadFails)
+    fake_site.outcome = _not_found
+    client = _wire_email_flow(monkeypatch, _make_email("x"))
+
+    main.check_for_new_event(headless=True)
+
+    db = _open(db_path)
+    assert len(db.get_speculative_events()) == 1
+    db.close()
+    assert "isn't posted" in client.replies[0].body
+
+
+class _RaisingRegisterSite(FakeRegisterSite):
+    error = None
+
+    def find_event_url(self, *a, **k):
+        return "https://x/Details/1"
+
+    def get_event_url(self, *a, **k):
+        return "https://x/Details/1"
+
+    def register_for_event(self, *a, **k):
+        raise _RaisingRegisterSite.error
+
+    def capture_failure(self, label):
+        return []
+
+
+def _raising_site(monkeypatch, error):
+    _RaisingRegisterSite.error = error
+    monkeypatch.setattr(main, "Website", _RaisingRegisterSite)
+    monkeypatch.setattr(main, "dwell_until", lambda *_a, **_k: None)
+
+
+def test_unverified_registration_is_flagged_in_the_result(monkeypatch):
+    _raising_site(monkeypatch, main.RegistrationUnverified("couldn't be checked"))
+    results = []
+
+    main.register_for_single_event(dict(_speculative_info(), status="confirmed"), results=results)
+
+    assert results[0]["success"] is False
+    assert results[0]["unverified"] is True
+
+
+def test_speculative_row_not_open_yet_goes_back_to_speculative(monkeypatch):
+    _raising_site(monkeypatch, main.RegistrationNotOpen("not open", opens_in=timedelta(hours=2)))
+    results = []
+
+    main.register_for_single_event(_speculative_info(), results=results)
+
+    assert results[0]["speculative_not_found"] is True
+    assert results[0]["not_open"] is True
+
+
+def test_confirmed_row_not_open_is_still_a_failure(monkeypatch):
+    _raising_site(monkeypatch, main.RegistrationNotOpen("not open"))
+    results = []
+
+    main.register_for_single_event(dict(_speculative_info(), status="confirmed"), results=results)
+
+    assert results[0]["success"] is False
+    assert not results[0].get("speculative_not_found")
+    assert results[0]["not_open"] is True
+
+
+def test_scheduler_not_open_speculative_row_stays_speculative_with_its_own_wording(monkeypatch, db_path):
+    _seed_speculative(db_path, registration_time=datetime.now() + timedelta(minutes=5))
+    client = _wire_registration(
+        monkeypatch, db_path,
+        {"success": False, "speculative_not_found": True, "not_open": True, "error": "not open"},
+    )
+
+    main.register_for_next_event(headless=True)
+
+    db = _open(db_path)
+    assert len(db.get_speculative_events()) == 1
+    db.close()
+    assert "registration wasn't open yet" in client.replies[0].body
+    assert client.notifications == []
+
+
+def test_scheduler_unverified_speculative_row_is_confirmed_with_a_warning(monkeypatch, db_path):
+    _seed_speculative(db_path, registration_time=datetime.now() + timedelta(minutes=5))
+    client = _wire_registration(
+        monkeypatch, db_path,
+        {"success": False, "unverified": True, "error": "couldn't be checked", "traceback": "tb"},
+    )
+
+    main.register_for_next_event(headless=True)
+
+    db = _open(db_path)
+    row = db.list_all_events("default")[0]
+    db.close()
+    assert row[4] == "confirmed"
+    assert row[3] == f"Speculative - {main.UNVERIFIED_INFO}"
+    assert "couldn't confirm" in client.replies[0].body
+    assert "didn't go through" not in client.replies[0].body
+    assert len(client.notifications) == 1
+
+
+def test_refresh_inline_unverified_registration_is_confirmed_with_a_warning(refresh_env, monkeypatch):
+    _seed_speculative(refresh_env.db_path, registration_time=datetime.now() - timedelta(hours=1))
+    refresh_env.site.outcome = lambda *_a: (datetime.now(), "info")
+
+    def unverified(event_info, headless=True, results=None, results_lock=None):
+        results.append({"user_tag": event_info["user_tag"], "event": "x", "success": False,
+                        "unverified": True, "error": "couldn't be checked", "traceback": "tb"})
+
+    monkeypatch.setattr(main, "register_for_single_event", unverified)
+
+    main.refresh_schedule_and_confirm_speculative(headless=True)
+
+    db = _open(refresh_env.db_path)
+    row = db.list_all_events("default")[0]
+    db.close()
+    assert row[4] == "confirmed"
+    assert row[3] == f"info - {main.UNVERIFIED_INFO}"
+    assert any("couldn't confirm" in r.body for r in refresh_env.client.replies)
+    assert len(refresh_env.client.notifications) == 1
+
+
+def test_scheduler_unverified_confirmed_row_gets_the_warning_without_a_reply(monkeypatch, db_path):
+    db = _open(db_path)
+    db.insert_event(_date_text(REQUESTED_DAY), SLOT_TEXT, datetime.now() + timedelta(minutes=5), "default",
+                    additional_info="$3 Intermediate Pickleball")
+    db.close()
+    client = _wire_registration(
+        monkeypatch, db_path,
+        {"success": False, "unverified": True, "error": "couldn't be checked", "traceback": "tb"},
+    )
+
+    main.register_for_next_event(headless=True)
+
+    db = _open(db_path)
+    row = db.list_all_events("default")[0]
+    db.close()
+    assert row[4] == "confirmed"
+    assert row[3] == f"$3 Intermediate Pickleball - {main.UNVERIFIED_INFO}"
+    assert client.replies == []
+    assert len(client.notifications) == 1
+
+
+def test_refresh_inline_registration_not_open_goes_back_to_speculative(refresh_env, monkeypatch):
+    _seed_speculative(refresh_env.db_path, registration_time=datetime.now() - timedelta(hours=1))
+    refresh_env.site.outcome = lambda *_a: (datetime.now(), "info")
+
+    def not_open(event_info, headless=True, results=None, results_lock=None):
+        results.append({"user_tag": event_info["user_tag"], "event": "x", "success": False,
+                        "not_open": True, "unverified": False, "error": "not open", "traceback": "tb"})
+
+    monkeypatch.setattr(main, "register_for_single_event", not_open)
+
+    main.refresh_schedule_and_confirm_speculative(headless=True)
+
+    db = _open(refresh_env.db_path)
+    rows = db.get_speculative_events()
+    db.close()
+    assert len(rows) == 1 and rows[0]["last_checked"] is None  # due again next run
+    assert any("registration wasn't open yet" in r.body for r in refresh_env.client.replies)
+    assert refresh_env.client.notifications == []
+
+
+def test_scheduler_cleanup_prunes_old_email_failure_counts(monkeypatch, db_path):
+    _seed_speculative(db_path, registration_time=datetime.now() + timedelta(minutes=5))
+    db = _open(db_path)
+    db.bump_email_failures("old", when=datetime.now() - timedelta(days=main.EMAIL_FAILURE_RETENTION_DAYS + 1))
+    db.bump_email_failures("recent")
+    db.close()
+    _wire_registration(monkeypatch, db_path, {"success": True})
+
+    main.register_for_next_event(headless=True)
+
+    db = _open(db_path)
+    assert db.get_email_failures("old") == 0
+    assert db.get_email_failures("recent") == 1
+    db.close()
+
+
+# --- round 3: not-open cap, rescheduling ---------------------------------------
+
+_NOT_OPEN = {"success": False, "speculative_not_found": True, "not_open": True, "error": "not open"}
+
+
+def test_repeated_not_open_is_capped_with_a_single_not_open_followup(monkeypatch, db_path):
+    _seed_speculative(db_path, registration_time=datetime.now() + timedelta(minutes=5))
+    client = _wire_registration(monkeypatch, db_path, _NOT_OPEN)
+
+    for _ in range(main.NOT_OPEN_LIMIT):
+        main.register_for_next_event(headless=True)
+
+    bodies = [r.body for r in client.replies]
+    assert sum("wasn't open yet" in b for b in bodies) == 1
+    assert "didn't go through" in bodies[-1]
+    db = _open(db_path)
+    assert db.list_all_events("default")[0][4] == "failed"
+    db.close()
+    assert len(client.notifications) == 1
+
+
+def _refresh_not_open(refresh_env, monkeypatch, prior_not_open):
+    _seed_speculative(refresh_env.db_path, registration_time=datetime.now() - timedelta(hours=1))
+    db = _open(refresh_env.db_path)
+    for _ in range(prior_not_open):
+        db.bump_not_open(_date_text(REQUESTED_DAY), SLOT_TEXT, "default")
+    db.close()
+    refresh_env.site.outcome = lambda *_a: (datetime.now(), "info")
+
+    def not_open(event_info, headless=True, results=None, results_lock=None):
+        results.append({"user_tag": event_info["user_tag"], "event": "x", "success": False,
+                        "not_open": True, "unverified": False, "error": "not open", "traceback": "tb"})
+
+    monkeypatch.setattr(main, "register_for_single_event", not_open)
+    main.refresh_schedule_and_confirm_speculative(headless=True)
+
+
+def test_refresh_second_not_open_sends_no_second_followup(refresh_env, monkeypatch):
+    _refresh_not_open(refresh_env, monkeypatch, prior_not_open=1)
+
+    db = _open(refresh_env.db_path)
+    assert len(db.get_speculative_events()) == 1
+    db.close()
+    assert refresh_env.client.replies == []
+
+
+def test_refresh_not_open_at_the_limit_fails_the_row(refresh_env, monkeypatch):
+    _refresh_not_open(refresh_env, monkeypatch, prior_not_open=main.NOT_OPEN_LIMIT - 1)
+
+    db = _open(refresh_env.db_path)
+    assert db.list_all_events("default")[0][4] == "failed"
+    db.close()
+    assert any("several times" in r.body for r in refresh_env.client.replies)
+    assert len(refresh_env.client.notifications) == 1
+
+
+def test_scheduler_reschedules_a_confirmed_row_that_is_not_open_yet(monkeypatch, db_path):
+    db = _open(db_path)
+    db.insert_event(_date_text(REQUESTED_DAY), SLOT_TEXT, datetime.now() + timedelta(minutes=5), "default")
+    db.close()
+    later = (datetime.now() + timedelta(days=1)).replace(hour=20, minute=0, second=0, microsecond=0)
+    client = _wire_registration(
+        monkeypatch, db_path,
+        {"success": False, "not_open": True, "reopens_at": later, "error": "not open", "traceback": "tb"},
+    )
+
+    main.register_for_next_event(headless=True)
+
+    db = _open(db_path)
+    row = db.list_all_events("default")[0]
+    db.close()
+    assert row[4] == "confirmed"
+    assert row[2] == later.strftime("%Y-%m-%d %H:%M:%S")
+    assert client.notifications == []
+
+
+def test_confirmed_row_not_open_without_countdown_is_still_a_failure(monkeypatch, db_path):
+    db = _open(db_path)
+    when = datetime.now() + timedelta(minutes=5)
+    db.insert_event(_date_text(REQUESTED_DAY), SLOT_TEXT, when, "default")
+    db.close()
+    client = _wire_registration(
+        monkeypatch, db_path,
+        {"success": False, "not_open": True, "reopens_at": None, "error": "not open", "traceback": "tb"},
+    )
+
+    main.register_for_next_event(headless=True)
+
+    assert len(client.notifications) == 1
+
+
+def test_not_open_result_carries_the_opening_on_the_users_clock(monkeypatch):
+    class NotOpenSite(_RaisingRegisterSite):
+        def login(self, user_tag=None):
+            self.default_registration_time = "20:00:00"
+
+    _RaisingRegisterSite.error = main.RegistrationNotOpen("not open", opens_in=timedelta(days=2, hours=1))
+    monkeypatch.setattr(main, "Website", NotOpenSite)
+    monkeypatch.setattr(main, "dwell_until", lambda *_a, **_k: None)
+    results = []
+
+    main.register_for_single_event(dict(_speculative_info(), status="confirmed"), results=results)
+
+    expected_day = (datetime.now() + timedelta(days=2, hours=1)).date()
+    assert results[0]["reopens_at"] == datetime.combine(expected_day, datetime.min.time()).replace(hour=20)
+
+
+# --- already registered -------------------------------------------------------
+
+
+def _already_registered(event_date, time_range):
+    raise main.AlreadyRegistered(f"Already registered for {event_date} {time_range}.")
+
+
+def test_add_for_a_date_already_registered_says_so(monkeypatch, db_path, fake_site):
+    fake_site.outcome = _already_registered
+    client = _wire_email_flow(monkeypatch, _make_email(f"{_date_text(REQUESTED_DAY)} {SLOT_TEXT}"))
+
+    main.check_for_new_event(headless=True)
+
+    assert [r.body for r in client.replies] == [
+        f"You're already registered for {_date_text(REQUESTED_DAY)} {SLOT_TEXT}."
+    ]
+    assert client.replies[0].subject == f"Event Registration: {_date_text(REQUESTED_DAY)} {SLOT_TEXT}"
+    assert client.notifications == []
+    assert client.marked_read_ids == ["msg-1"] and client.archived_ids == ["msg-1"]
+    db = _open(db_path)
+    assert db.list_all_events("default") == []
+    db.close()
+
+
+def test_refresh_treats_an_already_registered_speculative_date_as_done(refresh_env):
+    _seed_speculative(refresh_env.db_path)
+    refresh_env.site.outcome = _already_registered
+    before = datetime.now()
+
+    main.refresh_schedule_and_confirm_speculative(headless=True)
+
+    db = _open(refresh_env.db_path)
+    assert db.get_speculative_events() == []
+    (_date, _time, registration_time, info, status, _tag), = db.list_all_events("default")
+    db.close()
+    assert (status, info) == ("confirmed", "already registered")
+    # In the past, so the scheduler never tries to register it again.
+    registration_time = datetime.strptime(registration_time, events_module.TIMESTAMP_FORMAT)
+    assert before - timedelta(seconds=1) <= registration_time <= datetime.now()
+    assert refresh_env.registrations == []
+    assert len(refresh_env.client.replies) == 1
+    assert "already registered" in refresh_env.client.replies[0].body
+    assert refresh_env.client.replies[0].email.thread_id == "thread-1"
+    assert refresh_env.client.notifications == []
+
+
+@pytest.mark.parametrize("status, kept", [("speculative", False), ("confirmed", False), ("in_progress", True)])
+def test_add_for_a_date_already_registered_drops_its_pending_row(monkeypatch, db_path, fake_site, status, kept):
+    seed = _open(db_path)
+    seed.insert_event(
+        event_date=_date_text(REQUESTED_DAY), time_range=SLOT_TEXT,
+        registration_time=datetime.now() + timedelta(days=1), user_tag="default",
+        additional_info="x", status=status, expected_event_day=REQUESTED_DAY, request_ref=REQUEST_REF,
+    )
+    seed.close()
+    fake_site.outcome = _already_registered
+    client = _wire_email_flow(monkeypatch, _make_email(f"{_date_text(REQUESTED_DAY)} {SLOT_TEXT}"))
+
+    main.check_for_new_event(headless=True)
+
+    db = _open(db_path)
+    assert db.get_status(_date_text(REQUESTED_DAY), SLOT_TEXT, "default") == (status if kept else None)
+    db.close()
+    assert client.replies[0].body.startswith("You're already registered")
+
+
+def test_failure_report_keeps_the_snapshot_taken_before_the_recheck(monkeypatch):
+    class FailingSite(FakeRegisterSite):
+        def register_for_event(self, event_date, time_range, event_url):
+            import website
+
+            error = website.RegistrationError("signup failed")
+            error.failure_snapshots = ["before.png", "before.html"]
+            raise error
+
+        def capture_failure(self, label):
+            return [f"{label}.png"]
+
+    monkeypatch.setattr(FakeRegisterSite, "url", "https://x/Details/1")  # read by find_event_url
+    monkeypatch.setattr(main, "Website", FailingSite)
+    monkeypatch.setattr(main, "dwell_until", lambda *_a, **_k: None)
+    results = []
+
+    main.register_for_single_event(_speculative_info(), results=results)
+
+    assert results[0]["success"] is False
+    assert results[0]["snapshots"] == ["before.png", "before.html", "register_default.png"]

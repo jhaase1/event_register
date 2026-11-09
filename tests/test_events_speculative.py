@@ -371,3 +371,42 @@ def test_get_rows_at_returns_status_and_request_ref(db):
         {"event_date": "Tue, Oct 13", "time_range": "9a - 11a", "status": "speculative", "request_ref": REQUEST_REF}
     ]
     assert db.get_rows_at(datetime(2026, 10, 6, 14, 0, 0), "alice") == []
+
+
+def test_email_failures_are_counted_per_message_and_cleared(db):
+    assert db.get_email_failures("m1") == 0
+    assert db.bump_email_failures("m1") == 1
+    assert db.bump_email_failures("m1") == 2
+    assert db.bump_email_failures("m2") == 1
+
+    db.clear_email_failures("m1")
+
+    assert db.get_email_failures("m1") == 0
+    assert db.get_email_failures("m2") == 1
+
+
+def test_old_email_failure_counts_are_pruned(db):
+    db.bump_email_failures("old", when=datetime.now() - timedelta(days=8))
+    db.bump_email_failures("new")
+
+    db.remove_old_email_failures(n_days=7)
+
+    assert db.get_email_failures("old") == 0
+    assert db.get_email_failures("new") == 1
+
+
+def test_additional_info_can_be_read_and_replaced(db):
+    _insert_speculative(db)
+
+    db.set_additional_info("Tue, Oct 13", "9a - 11a", "default", "changed")
+
+    assert db.get_additional_info("Tue, Oct 13", "9a - 11a", "default") == "changed"
+    assert db.get_additional_info("Tue, Oct 13", "9a - 11a", "nobody") is None
+
+
+def test_not_open_outcomes_are_counted_per_row(db):
+    _insert_speculative(db)
+
+    assert db.bump_not_open("Tue, Oct 13", "9a - 11a", "default") == 1
+    assert db.bump_not_open("Tue, Oct 13", "9a - 11a", "default") == 2
+    assert db.bump_not_open("Tue, Oct 13", "9a - 11a", "nobody") == 0
