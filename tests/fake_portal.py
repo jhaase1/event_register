@@ -35,12 +35,22 @@ class El:
 
     @property
     def text(self):
+        # Like Selenium: an element it doesn't consider displayed has no text.
+        if not self.displayed:
+            return ""
         own = [self._text] if self._text else []
         return "\n".join(own + [c.text for c in self.children if c.text])
+
+    @property
+    def text_content(self):
+        # Like the DOM's textContent: everything, displayed or not.
+        return "".join([self._text or ""] + [c.text_content for c in self.children])
 
     def get_attribute(self, name):
         if name == "data-testid":
             return self.testid
+        if name == "textContent":
+            return self.text_content
         if name == "role":
             return self.role
         return None
@@ -136,6 +146,18 @@ class Series:
         # False: render a registered date without the live site's markup (no
         # row tag; Register button relabelled) - for testing fallback checks.
         self.registered_markup = True
+        # Text of a registered row's tag, and which header buttons replace
+        # Register: ('withdraw',) alone models a waitlist-like state.
+        self.registered_tag_text = "Registered"
+        self.registered_buttons = ("edit", "withdraw")
+        # find_elements calls after a load during which a registered date
+        # still renders as unregistered (status arriving after the page).
+        self.registered_markup_delay_finds = 0
+        # Likewise, counting only reads of a row's Registered tag (so a test
+        # can say exactly which read first sees it).
+        self.registered_tag_hidden_reads = 0
+        # False: the row tag is in the DOM but not displayed (no .text).
+        self.registered_tag_displayed = True
         self.register_click_error = None  # raised by a native click on Register
         # Renders of the signup page before its date header shows up.
         self.signup_date_delay_renders = 0
@@ -177,6 +199,8 @@ class FakePortal:
         self.gets = []
         self.screenshots = []
         self.pending = None  # (series, row, done_at) while a Finalize spinner runs
+        self.finds_since_load = 0
+        self.tag_reads_since_load = 0
 
     # --- driver API -------------------------------------------------------
     def get(self, url):
@@ -184,6 +208,8 @@ class FakePortal:
             self.pending = None  # left before the request finished
         self._settle_pending()
         self.gets.append(url)
+        self.finds_since_load = 0
+        self.tag_reads_since_load = 0
         self.dialog = None
         self.current_url = url
         self.scrolled = False
@@ -229,6 +255,9 @@ class FakePortal:
         return {"value": None}
 
     def find_elements(self, by, selector):
+        self.finds_since_load += 1
+        if selector.startswith("[data-testid='events-details-date-registered-"):
+            self.tag_reads_since_load += 1
         return _select(list(self._root().walk()), by, selector)
 
     def find_element(self, by, selector):
@@ -331,6 +360,11 @@ class FakePortal:
 
     def _details_page(self, s):
         selected = s.rows[s.selected]
+        # Until the delay passes, registered dates render like open ones.
+        settled = (
+            self.finds_since_load > s.registered_markup_delay_finds
+            and (not s.registered_tag_hidden_reads or self.tag_reads_since_load > s.registered_tag_hidden_reads)
+        )
         rows = []
         for i, row in enumerate(s.rows):
             def select(series=s, index=i):
@@ -347,9 +381,10 @@ class FakePortal:
                    text=f"{row.weekday}\n{row.day}\n{MONTH_ABBR[row.month]}"),
                 El(testid=f"events-details-date-row-time-{i}", text=row.time_text),
             ]
-            if row.registered and s.registered_markup:
+            if row.registered and s.registered_markup and settled:
                 # Live site (Nov 2026): a green "Registered" tag next to the time.
-                row_children.append(El(testid=f"events-details-date-registered-{i}", text="Registered"))
+                row_children.append(El(testid=f"events-details-date-registered-{i}", text=s.registered_tag_text,
+                                       displayed=s.registered_tag_displayed))
             row_children.append(status)
             rows.append(El(testid=f"events-details-date-row-{i}", on_click=select, children=row_children))
 
@@ -368,17 +403,20 @@ class FakePortal:
         if selected.state == "not_open":
             children.append(El(testid="events-details-signup-message",
                                text=selected.opens_in.replace("Single date registration", "Registration")))
-        elif selected.registered and s.registered_markup:
+        elif selected.registered and s.registered_markup and settled:
             # Live site (Nov 2026): Register is replaced by these two buttons.
-            children.append(El(testid="events-details-action-btns", children=[
-                El(testid="events-details-edit-registration-btn edit-registration-btn",
-                   text="Edit Registration", tag="button"),
-                El(testid="events-details-withdraw-btn withdraw-btn", text="Withdraw", tag="button"),
-            ]))
+            buttons = {
+                "edit": El(testid="events-details-edit-registration-btn edit-registration-btn",
+                           text="Edit Registration", tag="button"),
+                "withdraw": El(testid="events-details-withdraw-btn withdraw-btn", text="Withdraw", tag="button"),
+            }
+            children.append(El(testid="events-details-action-btns",
+                               children=[buttons[b] for b in s.registered_buttons]))
         else:
+            label = s.row_label(selected) if settled else "Register"
             children.append(El(
                 testid="events-details-register-btn events-details-register-single-btn register-btn",
-                text=s.row_label(selected), tag="button", on_click=register,
+                text=label, tag="button", on_click=register,
                 click_error=s.register_click_error,
             ))
         if s.description:

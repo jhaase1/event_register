@@ -20,6 +20,7 @@ import re
 import os
 import time
 import json
+import uuid
 from datetime import date, datetime, timedelta
 from urllib.parse import urlparse
 from logging_config import get_logger
@@ -164,6 +165,9 @@ FINALIZE_SETTLE_SECONDS = 10
 # The Finalize button can vanish behind a spinner while the request is still
 # going; only this long without it (still on the signup page) counts as done.
 SUBMIT_GONE_GRACE_SECONDS = 2
+# How long the reloaded details page gets to show a registration (row tag or
+# Edit Registration button) after it first renders a Register button.
+VERIFY_MARKUP_SECONDS = 3
 
 FAILURE_DIR = os.path.join("logs", "failures")
 FAILURE_RETENTION_DAYS = 14
@@ -306,6 +310,11 @@ class EventFull(Exception):
     """Raised when registration is open but the session is full (waitlist only)."""
 
 
+class AlreadyRegistered(Exception):
+    """Raised when the user is already registered for the requested date, so
+    neither a full session nor a skill restriction applies to them."""
+
+
 class RegistrationError(RuntimeError):
     """Raised when the registration step didn't go through or couldn't be confirmed."""
 
@@ -398,7 +407,11 @@ class Website:
         try:
             os.makedirs(FAILURE_DIR, exist_ok=True)
             self._prune_failures()
-            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            # Milliseconds plus a random suffix: two captures in the same
+            # second (or two runs at once) must never share a file, or one
+            # could overwrite - or delete - the other's snapshot.
+            now = datetime.now()
+            stamp = f"{now:%Y%m%d-%H%M%S}-{now.microsecond // 1000:03d}-{uuid.uuid4().hex[:6]}"
             base = os.path.join(FAILURE_DIR, f"{stamp}_{re.sub(r'[^A-Za-z0-9_-]+', '_', label)[:60]}")
             try:
                 if self.driver.save_screenshot(base + ".png"):
@@ -712,23 +725,78 @@ class Website:
                     "slots": self._text(DETAILS_ROW_SLOTS(index)),
                     "not_open": not_open,
                     "opens_in": _parse_opens_in(not_open) if not_open else None,
-                    "registered": bool(
-                        self.driver.find_elements(By.CSS_SELECTOR, DETAILS_ROW_REGISTERED(index))
-                    ),
+                    "registered": self._has_registered_tag(index),
                 }
             )
         return rows
 
+    def _has_registered_tag(self, index):
+        # The tag's text is checked, not just its presence: a waitlisted date
+        # (never seen on the live site) could well reuse the same slot.
+        # textContent first: Selenium's .text is "" for an element it doesn't
+        # consider displayed (e.g. scrolled inside a hidden overflow).
+        # A row re-rendering between the find and the read leaves a stale
+        # element; one fresh find is enough to read the new one.
+        for _attempt in range(2):
+            try:
+                return any(
+                    (element.get_attribute("textContent") or element.text or "").strip().lower() == "registered"
+                    for element in self.driver.find_elements(By.CSS_SELECTOR, DETAILS_ROW_REGISTERED(index))
+                )
+            except StaleElementReferenceException:
+                continue
+        return False
+
+    def _appears_within(self, condition, what):
+        """Whether `condition()` turns true within VERIFY_MARKUP_SECONDS
+        (capped by wait_time), re-reading the page as it is. For markup that
+        can render a moment after the rest of the page."""
+        seconds = min(VERIFY_MARKUP_SECONDS, getattr(self, "wait_time", 30))
+        try:
+            self._wait(lambda _driver: condition(), what, timeout=seconds)
+            return True
+        except TimeoutException:
+            return False
+
+    @staticmethod
+    def _requested_rows(rows, event_date, time_range):
+        """The rows that count as the requested date and time when deciding
+        whether it's registered. A row whose time can't be read only counts
+        when it's the date's only row: with several, it may well be another
+        session that day, and a false "registered" skips a registration."""
+        target = _parse_month_day(event_date or "")
+        query_time = _parse_time_range(time_range or "")
+        same_day = [r for r in rows if r["month_day"] == target]
+        return [
+            r for r in same_day
+            if r["time"] == query_time or (r["time"] is None and len(same_day) == 1)
+        ]
+
+    @staticmethod
+    def _matching_rows(rows, event_date, time_range):
+        """The rows to use for finding or selecting the requested date and
+        time: the exact time matches, else (the session's own time may be
+        unreadable) the date's rows whose time can't be read."""
+        target = _parse_month_day(event_date or "")
+        query_time = _parse_time_range(time_range or "")
+        same_day = [r for r in rows if r["month_day"] == target]
+        exact = [r for r in same_day if r["time"] == query_time]
+        return exact or [r for r in same_day if r["time"] is None]
+
+    @classmethod
+    def _requested_row(cls, rows, event_date, time_range):
+        """The row to use for the requested date, with "registered" decided by
+        the strict rule of _requested_rows; None if the date isn't there."""
+        row = next(iter(cls._matching_rows(rows, event_date, time_range)), None)
+        if row is None:
+            return None
+        counted = cls._requested_rows(rows, event_date, time_range)
+        return dict(row, registered=any(r["registered"] for r in counted))
+
     def _row_registered(self, event_date, time_range):
         """Whether the requested date's row carries the "Registered" tag. Read
         per row, so it doesn't depend on which date the header shows."""
-        target = _parse_month_day(event_date or "")
-        query_time = _parse_time_range(time_range or "")
-        return any(
-            row["registered"]
-            for row in self._details_rows()
-            if row["month_day"] == target and row["time"] in (None, query_time)
-        )
+        return any(row["registered"] for row in self._requested_rows(self._details_rows(), event_date, time_range))
 
     def _details_restriction(self):
         """Skill restriction text such as 'Intermediate, Advanced', or None."""
@@ -738,20 +806,32 @@ class Website:
                 return ", ".join(lines[1:]) or None
         return None
 
-    def _details_summary(self, card=None):
+    def _details_summary(self, card=None, restriction=None):
         parts = []
         if card:
             parts += [card.get("category"), card.get("name"), card.get("cost")]
-        restriction = self._details_restriction()
+        if restriction is None:
+            restriction = self._details_restriction()
         if restriction:
             parts.append(f"Skill Level Restriction: {restriction}")
         return " - ".join(p for p in parts if p)
 
-    def _find_occurrence(self, event_date, time_range, list_wait=None, attempts=3):
+    def _find_occurrence(self, event_date, time_range, list_wait=None, attempts=3, prefer_registered=False):
         """Finds the requested date within a listed series.
 
         Returns (details_url, row, card). Raises EventNotFound when no listed
         series has that date (it may not be posted yet).
+
+        With prefer_registered, an open series found first doesn't end the
+        search: the remaining series whose next date is the requested one are
+        checked for a registration the user already holds, and a full or
+        restricted series gets a moment for a slow "Registered" tag. Both cost
+        time, so only the lookup at email/refresh time asks for them, never
+        the lookups right before or at the opening.
+
+        That check is limited: only cards whose next date is the requested
+        date are looked at, so a series that lists the date further out (or
+        whose card only renders after scrolling) isn't checked for it.
         """
         self._go_to_events_page(attempts=attempts, wait_time=list_wait)
         candidates = self._series_candidates(event_date, time_range)
@@ -763,7 +843,6 @@ class Website:
         fully_rendered = self._list_fully_rendered()
 
         query_md = _parse_month_day(event_date or "")
-        query_time = _parse_time_range(time_range or "")
         # Several series can share a slot (e.g. an Advanced and an
         # Intermediate session at the same time), so a match the user can't
         # register for is only used if no other series fits.
@@ -774,7 +853,7 @@ class Website:
         on_list = True
         batch = candidates
         while True:
-            for card in batch:
+            for position, card in enumerate(batch):
                 if not on_list:
                     self._go_to_events_page(attempts=attempts, wait_time=list_wait)
                 visited.add(card["card_id"])
@@ -783,19 +862,50 @@ class Website:
                 if url is None:
                     skipped += 1
                     continue
-                row = next(
-                    (
-                        r for r in self._details_rows()
-                        if r["month_day"] == query_md and r["time"] in (None, query_time)
-                    ),
-                    None,
-                )
+                row = self._requested_row(self._details_rows(), event_date, time_range)
                 if row is None:
                     continue
-                match = (url, row, card, self._rows_as_observations(card))
-                skill_ok = self._skill_allowed_here()
-                if skill_ok and not self._row_full(row):
+                match = (url, row, card, self._rows_as_observations(card), self._details_restriction())
+                if row["registered"]:
+                    # The user already holds this slot in this series. Moving
+                    # on (say, because it's now full) could register them for
+                    # a second series at the same time.
+                    logger.info(
+                        f"Already registered for {event_date} {time_range} in series '{card.get('name')}'."
+                    )
                     return self._use_occurrence(event_date, time_range, match)
+                # The restriction read for the match decides here too, so the
+                # page is read once for both.
+                skill_ok = not match[4] or self._skill_level_allowed(match[4])
+                if skill_ok and not self._row_full(row):
+                    if prefer_registered:
+                        later = [
+                            c for c in batch[position + 1:]
+                            if c["card_id"] not in visited and c["month_day"] == query_md
+                        ]
+                        return self._registered_elsewhere_or(event_date, time_range, match, later, list_wait, attempts)
+                    return self._use_occurrence(event_date, time_range, match)
+                # Only here, about to move on to another series, is it worth
+                # giving a slow "Registered" tag a moment to render - and only
+                # when there's time for it, and the row counts as the
+                # requested session's by the strict rule.
+                if (
+                    prefer_registered
+                    and any(
+                        r["index"] == row["index"]
+                        for r in self._requested_rows(self._details_rows(), event_date, time_range)
+                    )
+                    and self._appears_within(
+                        lambda index=row["index"]: self._has_registered_tag(index),
+                        f"{event_date}'s Registered tag",
+                    )
+                ):
+                    logger.info(
+                        f"Already registered for {event_date} {time_range} in series '{card.get('name')}' "
+                        "(tag rendered late)."
+                    )
+                    row = dict(row, registered=True)
+                    return self._use_occurrence(event_date, time_range, (url, row, card) + match[3:])
                 logger.info(
                     f"{event_date} {time_range} in series '{card.get('name')}' is "
                     f"{'full' if skill_ok else 'skill-restricted'}; checking the other series in that slot."
@@ -835,6 +945,44 @@ class Website:
             + ")"
         )
 
+    def _registered_elsewhere_or(self, event_date, time_range, open_match, others, list_wait, attempts):
+        """Returns the first of `others` (list cards) in which the user is
+        already registered for the date, else `open_match`, left on screen.
+
+        Only series whose next date is the requested one are passed in: their
+        cards are already known, so checking them is cheap compared with
+        finding every series that lists the date further out. The check is
+        optional, so a page that fails to load just ends it."""
+        for card in others:
+            try:
+                self._go_to_events_page(attempts=attempts, wait_time=list_wait)
+                url = self._open_details_from_card(card["card_id"], wait_time=list_wait)
+                if url is None:
+                    continue
+                row = self._requested_row(self._details_rows(), event_date, time_range)
+                if row is None or not row["registered"]:
+                    continue
+                match = (url, row, card, self._rows_as_observations(card), self._details_restriction())
+            except WebDriverException as e:  # includes TimeoutException
+                logger.warning(
+                    f"Couldn't check series '{card.get('name')}' for a registration; using the open one. {e}"
+                )
+                break
+            logger.info(
+                f"Already registered for {event_date} {time_range} in series '{card.get('name')}', "
+                f"not the open series '{open_match[2].get('name')}'."
+            )
+            return self._use_occurrence(event_date, time_range, match)
+        if self.driver.current_url != open_match[0]:
+            # Show this series again, as callers expect; if that fails they
+            # still get its restriction from last_details_restriction.
+            try:
+                self._get_with_retry(open_match[0])
+                self._wait_for_details_page(timeout=list_wait)
+            except WebDriverException as e:  # includes TimeoutException
+                logger.warning(f"Couldn't reload the open series' page; using it anyway. {e}")
+        return self._use_occurrence(event_date, time_range, open_match)
+
     def _list_fully_rendered(self):
         total = self._total_events_count()
         return total is None or len(self._list_card_ids()) >= total
@@ -843,15 +991,13 @@ class Website:
     def _row_full(row):
         return row["not_open"] is None and bool(row["slots"]) and "full" in row["slots"].lower()
 
-    def _skill_allowed_here(self):
-        """Whether the current details page's skill restriction allows this user."""
-        restriction = self._details_restriction()
-        return not restriction or self._skill_level_allowed(restriction)
-
     def _use_occurrence(self, event_date, time_range, match):
-        url, row, card, observations = match
+        url, row, card, observations, restriction = match
         self.last_details_card = card
         self.last_details_rows = observations
+        # Read while the match's page was showing, so it's right even if the
+        # page shown now is another series'.
+        self.last_details_restriction = restriction
         logger.info(
             f"Found {event_date} {time_range} in series '{card.get('name')}' "
             f"(row {row['index']}, {'not open: ' + row['not_open'] if row['not_open'] else 'open: ' + str(row['slots'])})"
@@ -886,8 +1032,9 @@ class Website:
             return True
         return self.skill_level.strip().lower() in restriction_text.lower()
 
-    def _check_restriction(self):
-        restriction = self._details_restriction()
+    def _check_restriction(self, restriction=None):
+        if restriction is None:
+            restriction = self._details_restriction()
         if restriction and not self._skill_level_allowed(restriction):
             logger.info(
                 f"Configured skill level '{self.skill_level}' does not meet restriction '{restriction}'."
@@ -904,6 +1051,7 @@ class Website:
         """Returns (when registration opens, summary) for the requested date.
 
         Raises EventNotFound if no listed series has the date,
+        AlreadyRegistered if the user is already registered for it,
         SkillLevelIneligible if the skill restriction excludes the user, and
         EventFull if registration is open but the session is full.
         """
@@ -911,10 +1059,16 @@ class Website:
         if registration_time is None:
             registration_time = self.default_registration_time
 
-        url, row, card = self._find_occurrence(event_date, time_range)
+        url, row, card = self._find_occurrence(event_date, time_range, prefer_registered=True)
         self.last_details_url = url
-        summary = self._details_summary(card)
-        self._check_restriction()
+        # "" (no restriction) stays "", so the page isn't read again.
+        restriction = self.last_details_restriction or ""
+        summary = self._details_summary(card, restriction)
+        # Before the restriction and full checks: neither matters to a user
+        # who already holds the spot, and "full" would be a confusing reply.
+        if row["registered"]:
+            raise AlreadyRegistered(f"Already registered for {event_date} {time_range}.")
+        self._check_restriction(restriction)
 
         if row["not_open"] is None:
             if row["slots"] and "full" in row["slots"].lower():
@@ -934,6 +1088,8 @@ class Website:
         """The details-page URL of the series containing the requested date, or None."""
         logger.info(f"Finding event URL for event: {event_date}, {time_range}")
         try:
+            # Called shortly before the opening, so no prefer_registered: its
+            # extra page loads would eat into that time.
             url, _row, _card = self._find_occurrence(event_date, time_range)
         except EventNotFound as e:
             logger.error(str(e))
@@ -1007,15 +1163,32 @@ class Website:
     def _header_month_day(self):
         return _parse_month_day(self._text(DETAILS_HEADER_DATE) or "")
 
-    def _details_button_label(self):
+    def _details_button_label(self, event_date, time_range):
         label = (self._text(DETAILS_REGISTER_BTN) or "").lower()
-        if not label and self.driver.find_elements(
-            By.CSS_SELECTOR, f"{DETAILS_EDIT_REGISTRATION_BTN}, {DETAILS_WITHDRAW_BTN}"
-        ):
+        if not label and self._edit_registration_is_for(event_date, time_range):
             # The header date is already registered: the site shows Edit
-            # Registration / Withdraw instead of a Register button.
+            # Registration / Withdraw instead of a Register button. Withdraw
+            # alone isn't enough - a waitlist spot could offer it too.
             return "edit registration"
         return label
+
+    def _edit_registration_is_for(self, event_date, time_range):
+        """Whether an Edit Registration button is showing and can be taken as
+        the requested date's.
+
+        The button belongs to the header's date, so it says nothing while the
+        header shows another one. And if another date's row is tagged
+        Registered but the requested one isn't, the button is more likely
+        left over from that date than proof for this one."""
+        if not self.driver.find_elements(By.CSS_SELECTOR, DETAILS_EDIT_REGISTRATION_BTN):
+            return False
+        if self._header_month_day() != _parse_month_day(event_date or ""):
+            return False
+        rows = self._details_rows()
+        mine = self._requested_rows(rows, event_date, time_range)
+        mine_tagged = any(r["registered"] for r in mine)
+        tagged_elsewhere = any(r["registered"] for r in rows if r not in mine)
+        return not (tagged_elsewhere and not mine_tagged)
 
     def _select_date(self, event_date, time_range):
         """Makes sure the details page header shows the requested date, since
@@ -1024,20 +1197,18 @@ class Website:
         target = _parse_month_day(event_date or "")
         if self._header_month_day() == target:
             return
-        query_time = _parse_time_range(time_range or "")
-        for row in self._details_rows():
-            if row["month_day"] == target and row["time"] in (None, query_time):
-                element = self.driver.find_element(By.CSS_SELECTOR, DETAILS_ROW(row["index"]))
-                self.driver.execute_script("arguments[0].click();", element)
-                try:
-                    self._wait(
-                        lambda d: self._header_month_day() == target,
-                        f"{event_date} to be selected",
-                        min(5, getattr(self, "wait_time", 30)),
-                    )
-                    return
-                except TimeoutException:
-                    break
+        for row in self._matching_rows(self._details_rows(), event_date, time_range):
+            element = self.driver.find_element(By.CSS_SELECTOR, DETAILS_ROW(row["index"]))
+            self.driver.execute_script("arguments[0].click();", element)
+            try:
+                self._wait(
+                    lambda d: self._header_month_day() == target,
+                    f"{event_date} to be selected",
+                    min(5, getattr(self, "wait_time", 30)),
+                )
+                return
+            except TimeoutException:
+                break
         raise RegistrationError(
             f"The details page shows {self._text(DETAILS_HEADER_DATE)!r}, not {event_date}, "
             "and selecting that date didn't work"
@@ -1064,7 +1235,7 @@ class Website:
         details_url = self.driver.current_url
         self._check_restriction()
 
-        label = self._details_button_label()
+        label = self._details_button_label(event_date, time_range)
         opens_in = None
         if label not in OPEN_LABELS:
             label, opens_in = self._wait_for_opening(event_date, time_range, details_url)
@@ -1091,9 +1262,58 @@ class Website:
         self._click(self.driver.find_element(By.CSS_SELECTOR, DETAILS_REGISTER_BTN), "Register")
         logger.info(f"Clicked Register for {event_date} {time_range} (user '{self.user_tag}').")
 
-        outcome = self._finalize_signup(event_date)
-        self._verify_registered(event_date, time_range, details_url, outcome)
+        # The signup or the check can go wrong while the registration still
+        # went through; the date's own tag on a fresh load settles it.
+        try:
+            outcome = self._finalize_signup(event_date)
+        except (RegistrationError, WebDriverException) as error:
+            if self._registered_after_failure(event_date, time_range, details_url, error):
+                return
+            raise
+        try:
+            self._verify_registered(event_date, time_range, details_url, outcome)
+        except WebDriverException as error:
+            # The reload or a read broke before the tag could be checked. A
+            # RegistrationError, by contrast, comes after verification has
+            # reloaded and read (and waited for) the tag, so it stands.
+            if self._registered_after_failure(event_date, time_range, details_url, error):
+                return
+            raise
         logger.info(f"Registered for {event_date} {time_range} (user '{self.user_tag}').")
+
+    def _registered_after_failure(self, event_date, time_range, details_url, error):
+        """Whether the details page shows the date as registered after a
+        failed signup or verification. Never raises: the original error is
+        what gets reported if this can't tell.
+
+        The page that failed is saved first, since the re-check replaces it.
+        If the date turns out registered, that snapshot is deleted (it isn't
+        a failure); otherwise its paths go on `error.failure_snapshots` for
+        the caller's report."""
+        snapshots = self.capture_failure(f"register_before_recheck_{getattr(self, 'user_tag', None)}")
+        try:
+            self._get_with_retry(details_url)
+            self._wait_for_details_page()
+            registered = self._row_registered(event_date, time_range)
+        except Exception as e:
+            logger.warning(f"Couldn't re-check {event_date} {time_range} after a failure: {e!r}")
+            registered = False
+        if not registered:
+            try:
+                error.failure_snapshots = snapshots
+            except Exception:
+                pass
+            return False
+        for path in snapshots:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        logger.info(
+            f"Registered for {event_date} {time_range} (user '{self.user_tag}'): the date is "
+            f"marked Registered despite {type(error).__name__}: {error}"
+        )
+        return True
 
     def _click(self, element, what):
         try:
@@ -1106,13 +1326,8 @@ class Website:
         """The requested date's registration countdown: its row's not-open
         text, else the header's signup message when the header is that date."""
         target = _parse_month_day(event_date or "")
-        query_time = _parse_time_range(time_range or "")
-        for row in self._details_rows():
-            if (
-                row["month_day"] == target
-                and row["time"] in (None, query_time)
-                and row["opens_in"] is not None
-            ):
+        for row in self._matching_rows(self._details_rows(), event_date, time_range):
+            if row["opens_in"] is not None:
                 return row["opens_in"]
         if self._header_month_day() == target:
             return _parse_opens_in(self._text(DETAILS_SIGNUP_MESSAGE))
@@ -1126,7 +1341,7 @@ class Website:
         countdown of a minute or two usually means the site's clock is a
         little behind, not that the time is wrong. Returns (button label,
         countdown last seen)."""
-        label = self._details_button_label()
+        label = self._details_button_label(event_date, time_range)
         opens_in = self._selected_opens_in(event_date, time_range)
         if opens_in is None or opens_in > OPENING_SOON:
             return label, opens_in
@@ -1148,7 +1363,7 @@ class Website:
                 logger.warning(f"Reload while waiting for {event_date} to open failed: {e}")
                 continue
             self._select_date(event_date, time_range)
-            label = self._details_button_label()
+            label = self._details_button_label(event_date, time_range)
             if label in OPEN_LABELS:
                 return label, None
             seen = self._selected_opens_in(event_date, time_range)
@@ -1265,6 +1480,12 @@ class Website:
         # whichever date the header shows.
         if self._row_registered(event_date, time_range):
             return
+        # Selecting the date by clicking its row may not work, so when the
+        # header shows another date give a slow tag a moment first.
+        if self._header_month_day() != _parse_month_day(event_date or "") and self._appears_within(
+            lambda: self._row_registered(event_date, time_range), f"{event_date}'s Registered tag"
+        ):
+            return
         try:
             self._select_date(event_date, time_range)
         except RegistrationError:
@@ -1277,10 +1498,12 @@ class Website:
             if not left_signup:
                 raise RegistrationError(message)
             raise RegistrationUnverified(message)
-        label = self._details_button_label()
+        label = self._details_button_label(event_date, time_range)
         if label in REGISTERED_LABELS:
             return
         if label in (LABEL_REGISTER, LABEL_WAITLIST):
+            if self._registered_markup_appears(event_date, time_range):
+                return
             raise RegistrationError(
                 f"Clicked Finalize Registration for {event_date} {time_range}, but the details "
                 f"page still shows '{label}' rather than a registration."
@@ -1290,6 +1513,20 @@ class Website:
         raise RegistrationUnverified(
             f"Finalize Registration was clicked for {event_date} {time_range} but the result "
             f"couldn't be checked: the details page button reads '{label or 'nothing'}'"
+        )
+
+    def _registered_markup_appears(self, event_date, time_range):
+        """Whether the date's Registered tag or (for the requested date) the
+        Edit Registration button shows up within VERIFY_MARKUP_SECONDS,
+        re-reading the page as it is.
+
+        A just-loaded page may still show the Register button it rendered
+        before the registration status arrived; calling that a failure would
+        report a registration that went through as one that didn't."""
+        return self._appears_within(
+            lambda: self._row_registered(event_date, time_range)
+            or self._edit_registration_is_for(event_date, time_range),
+            f"{event_date} to show as registered",
         )
 
     def close(self):

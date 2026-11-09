@@ -4,6 +4,7 @@ import json
 from events import Events
 from website import (
     Website,
+    AlreadyRegistered,
     SkillLevelIneligible,
     EventNotFound,
     EventFull,
@@ -288,7 +289,11 @@ def register_for_single_event(
             exc_info=True,
         )
         tb = traceback.format_exc()
-        snapshots = _capture_failure(website, f"register_{user_tag}")
+        # The website may already have saved the page that failed before
+        # re-checking it; this one is the page as it stands now.
+        snapshots = list(getattr(e, "failure_snapshots", None) or []) + _capture_failure(
+            website, f"register_{user_tag}"
+        )
         _record_result(
             {
                 "user_tag": user_tag,
@@ -804,6 +809,17 @@ def _supersede_existing_row(events, event_date, time_range, user_tag):
     return status != "in_progress"
 
 
+def _drop_rows_already_registered(events, event_date, time_range, user_tag):
+    """Removes this user's speculative or confirmed row for an event they're
+    already registered for, so nothing tries to register it again. A row
+    being registered right now ('in_progress') is left to that run."""
+    status = events.get_status(event_date, time_range, user_tag)
+    if status in ("speculative", "confirmed") and events.remove_event_if_status(
+        event_date, time_range, user_tag, status
+    ):
+        logger.info(f"Removed {status} row for {event_date} {time_range} ('{user_tag}'): already registered.")
+
+
 def _take_slot_for_speculative(events, email_client, row, registration_time):
     """Makes room for a speculative row at its real registration time.
 
@@ -1149,6 +1165,19 @@ def check_for_new_event(headless=True, pending_open=None):
                         registration_time, additional_info = website.determine_access_date(
                             event_date, time_range
                         )
+                    except AlreadyRegistered as e:
+                        # Not a failure, so no webmaster notice.
+                        logger.info(f"Already registered for user '{user_tag}': {e}")
+                        _drop_rows_already_registered(events, event_date, time_range, user_tag)
+                        email_client.reply_to_email(
+                            email,
+                            f"You're already registered for {event_date} {time_range}.",
+                            subject=f"Event Registration: {event_date} {time_range}",
+                            user_tag=user_tag,
+                        )
+                        email_client.mark_email_as_read(email)
+                        email_client.archive_email(email)
+                        continue
                     except SkillLevelIneligible as e:
                         logger.info(
                             f"Event not eligible for user '{user_tag}' due to skill level: {e}"
@@ -1475,6 +1504,20 @@ def _check_speculative_row(events, website, email_client, row, now, executor, he
 
     try:
         registration_time, additional_info = website.determine_access_date(event_date, time_range)
+    except AlreadyRegistered as e:
+        # The user signed up some other way; that's the outcome they asked
+        # for. Confirmed with a past time so the scheduler doesn't try again.
+        if not events.confirm_event(
+            event_date, time_range, user_tag, datetime.now(), "already registered", expected="speculative"
+        ):
+            decide("skip", "changed by another run before confirming")
+            return None
+        decide("confirm", f"already registered: {e}")
+        _reply_to_request(
+            email_client, row["request_ref"],
+            f"The {label} session is posted, and you're already registered for it.", user_tag,
+        )
+        return None
     except SkillLevelIneligible as e:
         decide("drop", f"skill-ineligible: {e}")
         _drop_speculative(events, email_client, row, str(e))

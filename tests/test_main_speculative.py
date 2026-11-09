@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import events as events_module
 import main
 from events import Events
 
@@ -2091,3 +2092,92 @@ def test_not_open_result_carries_the_opening_on_the_users_clock(monkeypatch):
 
     expected_day = (datetime.now() + timedelta(days=2, hours=1)).date()
     assert results[0]["reopens_at"] == datetime.combine(expected_day, datetime.min.time()).replace(hour=20)
+
+
+# --- already registered -------------------------------------------------------
+
+
+def _already_registered(event_date, time_range):
+    raise main.AlreadyRegistered(f"Already registered for {event_date} {time_range}.")
+
+
+def test_add_for_a_date_already_registered_says_so(monkeypatch, db_path, fake_site):
+    fake_site.outcome = _already_registered
+    client = _wire_email_flow(monkeypatch, _make_email(f"{_date_text(REQUESTED_DAY)} {SLOT_TEXT}"))
+
+    main.check_for_new_event(headless=True)
+
+    assert [r.body for r in client.replies] == [
+        f"You're already registered for {_date_text(REQUESTED_DAY)} {SLOT_TEXT}."
+    ]
+    assert client.replies[0].subject == f"Event Registration: {_date_text(REQUESTED_DAY)} {SLOT_TEXT}"
+    assert client.notifications == []
+    assert client.marked_read_ids == ["msg-1"] and client.archived_ids == ["msg-1"]
+    db = _open(db_path)
+    assert db.list_all_events("default") == []
+    db.close()
+
+
+def test_refresh_treats_an_already_registered_speculative_date_as_done(refresh_env):
+    _seed_speculative(refresh_env.db_path)
+    refresh_env.site.outcome = _already_registered
+    before = datetime.now()
+
+    main.refresh_schedule_and_confirm_speculative(headless=True)
+
+    db = _open(refresh_env.db_path)
+    assert db.get_speculative_events() == []
+    (_date, _time, registration_time, info, status, _tag), = db.list_all_events("default")
+    db.close()
+    assert (status, info) == ("confirmed", "already registered")
+    # In the past, so the scheduler never tries to register it again.
+    registration_time = datetime.strptime(registration_time, events_module.TIMESTAMP_FORMAT)
+    assert before - timedelta(seconds=1) <= registration_time <= datetime.now()
+    assert refresh_env.registrations == []
+    assert len(refresh_env.client.replies) == 1
+    assert "already registered" in refresh_env.client.replies[0].body
+    assert refresh_env.client.replies[0].email.thread_id == "thread-1"
+    assert refresh_env.client.notifications == []
+
+
+@pytest.mark.parametrize("status, kept", [("speculative", False), ("confirmed", False), ("in_progress", True)])
+def test_add_for_a_date_already_registered_drops_its_pending_row(monkeypatch, db_path, fake_site, status, kept):
+    seed = _open(db_path)
+    seed.insert_event(
+        event_date=_date_text(REQUESTED_DAY), time_range=SLOT_TEXT,
+        registration_time=datetime.now() + timedelta(days=1), user_tag="default",
+        additional_info="x", status=status, expected_event_day=REQUESTED_DAY, request_ref=REQUEST_REF,
+    )
+    seed.close()
+    fake_site.outcome = _already_registered
+    client = _wire_email_flow(monkeypatch, _make_email(f"{_date_text(REQUESTED_DAY)} {SLOT_TEXT}"))
+
+    main.check_for_new_event(headless=True)
+
+    db = _open(db_path)
+    assert db.get_status(_date_text(REQUESTED_DAY), SLOT_TEXT, "default") == (status if kept else None)
+    db.close()
+    assert client.replies[0].body.startswith("You're already registered")
+
+
+def test_failure_report_keeps_the_snapshot_taken_before_the_recheck(monkeypatch):
+    class FailingSite(FakeRegisterSite):
+        def register_for_event(self, event_date, time_range, event_url):
+            import website
+
+            error = website.RegistrationError("signup failed")
+            error.failure_snapshots = ["before.png", "before.html"]
+            raise error
+
+        def capture_failure(self, label):
+            return [f"{label}.png"]
+
+    monkeypatch.setattr(FakeRegisterSite, "url", "https://x/Details/1")  # read by find_event_url
+    monkeypatch.setattr(main, "Website", FailingSite)
+    monkeypatch.setattr(main, "dwell_until", lambda *_a, **_k: None)
+    results = []
+
+    main.register_for_single_event(_speculative_info(), results=results)
+
+    assert results[0]["success"] is False
+    assert results[0]["snapshots"] == ["before.png", "before.html", "register_default.png"]
