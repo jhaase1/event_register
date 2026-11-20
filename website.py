@@ -37,7 +37,10 @@ logger.setLevel("DEBUG")
 # details page.
 
 # Events list page
-LIST_RESULTS_HEADER = "[data-testid='events-list-results-header']"  # "20 events found"
+# The "20 events found" count lost its data-testid in Nov 2026 (it's a plain div now),
+# so it's located by its text; the grid is the stable testid'd "list rendered" signal.
+LIST_GRID = "[data-testid='events-list-grid']"
+LIST_COUNT_XPATH = "//*[contains(normalize-space(text()), 'events found') or contains(normalize-space(text()), 'event found')]"
 LIST_CARD_PREFIX = "events-list-card-"
 LIST_CARD_ANY = f"[data-testid^='{LIST_CARD_PREFIX}']"
 LIST_CARD_ID_RE = re.compile(rf"^{LIST_CARD_PREFIX}(\d+)$")
@@ -507,12 +510,13 @@ class Website:
         """
         for attempt in range(1, attempts + 1):
             logger.info(f"Navigating to events page: {self.events_url}")
-            # The results header ("N events found") is rendered even when there
-            # are no events, so it's the "list finished loading" signal.
+            # The card grid, or the "N events found" count (rendered even with no
+            # events), means the list finished loading.
             try:
                 self.driver.get(self.events_url)
                 self._wait(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, LIST_RESULTS_HEADER)),
+                    lambda d: d.find_elements(By.CSS_SELECTOR, LIST_GRID)
+                    or d.find_elements(By.XPATH, LIST_COUNT_XPATH),
                     "the events list",
                     timeout=wait_time,
                 )
@@ -532,7 +536,7 @@ class Website:
 
     def _total_events_count(self):
         try:
-            text = self.driver.find_element(By.CSS_SELECTOR, LIST_RESULTS_HEADER).text
+            text = self.driver.find_element(By.XPATH, LIST_COUNT_XPATH).text
         except NoSuchElementException:
             return None
         match = re.search(r"(\d+)\s+events?\s+found", text, re.IGNORECASE)

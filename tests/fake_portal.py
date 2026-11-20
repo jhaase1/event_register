@@ -114,6 +114,8 @@ def _select(elements, by, selector):
             e for e in elements
             if INELIGIBLE_MARK in (e._text or "").lower() and e.tag_name not in ("script", "style")
         ]
+    if by == By.XPATH and "events found" in selector:
+        return [e for e in elements if re.search(r"events? found", e._text or "")]
     raise AssertionError(f"fake doesn't support {by} {selector}")
 
 
@@ -324,7 +326,8 @@ class FakePortal:
                 El(testid=f"events-list-view-upcoming-dates-btn-{cid}", text="VIEW UPCOMING DATES", tag="button",
                    on_click=open_details),
             ]))
-        header = El(testid="events-list-results-header", text=f"{len(self.series)} events found")
+        # No data-testid, like the live site since Nov 2026.
+        header = El(text=f"{len(self.series)} events found")
         return [header, El(testid="events-list-grid", children=cards)]
 
     def _signup_page(self, s):
