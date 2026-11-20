@@ -335,8 +335,9 @@ def test_details_wait_requires_date_rows_not_just_the_list_container():
     def rows_not_rendered(s):
         children = original(s)
         for child in children:
-            if child.testid == "events-details-dates-list":
-                child.children = []
+            for part in child.children:
+                if part.testid == "events-details-tabs":
+                    part.children = []
         return children
 
     fake._details_page = rows_not_rendered
@@ -353,7 +354,10 @@ def test_details_wait_tolerates_a_header_without_button_or_message():
     original = fake._details_page
 
     def without_button(s):
-        return [c for c in original(s) if "register-btn" not in (c.testid or "")]
+        children = original(s)
+        for c in children:
+            c.children = [x for x in c.children if "register-btn" not in (x.testid or "")]
+        return children
 
     fake._details_page = without_button
 
@@ -1095,7 +1099,10 @@ def test_open_date_without_a_register_button_is_a_failure_not_not_open():
     original = fake._details_page
 
     def without_button(s):
-        return [c for c in original(s) if "register-btn" not in (c.testid or "")]
+        children = original(s)
+        for c in children:
+            c.children = [x for x in c.children if "register-btn" not in (x.testid or "")]
+        return children
 
     fake._details_page = without_button
 
@@ -1540,12 +1547,15 @@ def test_edit_registration_is_not_trusted_when_only_another_row_is_tagged():
     original = fake._details_page
 
     def stale_buttons(s):
-        return [
-            El(testid="events-details-edit-registration-btn edit-registration-btn", text="Edit Registration",
-               tag="button")
-            if "register-btn" in (c.testid or "") else c
-            for c in original(s)
-        ]
+        children = original(s)
+        for c in children:
+            c.children = [
+                El(testid="events-details-edit-registration-btn edit-registration-btn", text="Edit Registration",
+                   tag="button")
+                if "register-btn" in (x.testid or "") else x
+                for x in c.children
+            ]
+        return children
 
     fake._details_page = stale_buttons
     fake.get(_details_url("SERIES101"))
@@ -1669,10 +1679,14 @@ def test_a_stale_registered_tag_is_found_again_once(stale_reads, expected):
     real_find = fake.find_elements
     left = {"stale": stale_reads}
 
-    def find_elements(by, selector):
-        if selector == website.DETAILS_ROW_REGISTERED(0) and left["stale"]:
-            left["stale"] -= 1
+    class _StaleRow:
+        def find_elements(self, by, selector):
             return [_StaleTag()]
+
+    def find_elements(by, selector):
+        if selector == website.DETAILS_ROW_TIME(0) and left["stale"]:
+            left["stale"] -= 1
+            return [_StaleRow()]
         return real_find(by, selector)
 
     fake.find_elements = find_elements

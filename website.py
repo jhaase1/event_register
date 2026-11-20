@@ -82,34 +82,32 @@ def LIST_CARD_UPCOMING(card_id):
     return _testid(f"events-list-view-upcoming-dates-btn-{card_id}")
 
 
-# Series details page
-DETAILS_PAGE = _testid("events-details-page")
-DETAILS_DATES_LIST = _testid("events-details-dates-list")
-DETAILS_HEADER_DATE = _testid("events-details-date")
-DETAILS_HEADER_TIME = _testid("events-details-time")
-DETAILS_SLOTS = _testid("events-details-slots")
-DETAILS_SIGNUP_MESSAGE = _testid("events-details-signup-message")
-# data-testid holds several space-separated values here, hence ~=.
+# Series details page. Since Nov 2026 the date rows, header and side panel carry
+# few test ids, so those are read by position relative to the ones that remain:
+#   row     = div[ date block (weekday / day / month),
+#                  div[ div[ time (testid), optional tag span ], slots | not-open (testid) ] ]
+#   header  = the card's leaf texts before the tabs (date, time, slots, "Registration opens ...")
+DETAILS_CARD = "[data-testid^='events-details-card-']"
+DETAILS_TABS_NAME = "events-details-tabs"
+# data-testid holds several space-separated values on these buttons, hence ~=.
 DETAILS_REGISTER_BTN = "[data-testid~='events-details-register-btn']"
+DETAILS_WAITLIST_BTN = "[data-testid~='events-details-join-waitlist-btn']"
 # Once registered, the Register button is replaced by these two (live site,
 # Nov 2026), and the date's row gets a "Registered" tag.
 DETAILS_EDIT_REGISTRATION_BTN = "[data-testid~='events-details-edit-registration-btn']"
 DETAILS_WITHDRAW_BTN = "[data-testid~='events-details-withdraw-btn']"
-DETAILS_RESTRICTION = "[data-testid^='events-details-side-restriction-']"
-DETAILS_ROW_PREFIX = "events-details-date-row-"
-DETAILS_ROW_ID_RE = re.compile(rf"^{DETAILS_ROW_PREFIX}(\d+)$")
-
-
-def DETAILS_ROW(index):
-    return _testid(f"events-details-date-row-{index}")
-
-
-def DETAILS_ROW_DATE(index):
-    return _testid(f"events-details-date-row-date-{index}")
+DETAILS_SIDE = _testid("events-details-side")
+DETAILS_ROW_TIME_PREFIX = "events-details-date-row-time-"
+DETAILS_ROW_ID_RE = re.compile(rf"^{DETAILS_ROW_TIME_PREFIX}(\d+)$")
+# Header leaf texts: everything except the title and the dates tab's rows.
+DETAILS_HEADER_LEAVES_XPATH = (
+    ".//*[not(*)][not(ancestor::h1)]"
+    f"[not(ancestor::*[@data-testid='{DETAILS_TABS_NAME}'])]"
+)
 
 
 def DETAILS_ROW_TIME(index):
-    return _testid(f"events-details-date-row-time-{index}")
+    return _testid(f"{DETAILS_ROW_TIME_PREFIX}{index}")
 
 
 def DETAILS_ROW_SLOTS(index):
@@ -118,10 +116,6 @@ def DETAILS_ROW_SLOTS(index):
 
 def DETAILS_ROW_NOT_OPEN(index):
     return _testid(f"events-details-date-not-open-{index}")
-
-
-def DETAILS_ROW_REGISTERED(index):
-    return _testid(f"events-details-date-registered-{index}")
 
 
 # Button labels (lowercased) on list cards and the details page.
@@ -695,12 +689,11 @@ class Website:
         hydrate = min(DETAILS_HYDRATE_SECONDS, getattr(self, "wait_time", 30) if timeout is None else timeout)
         try:
             self._wait(
-                EC.presence_of_element_located(
-                    (
-                        By.CSS_SELECTOR,
-                        f"{DETAILS_REGISTER_BTN}, {DETAILS_SIGNUP_MESSAGE}, {DETAILS_EDIT_REGISTRATION_BTN}",
-                    )
-                ),
+                lambda d: d.find_elements(
+                    By.CSS_SELECTOR,
+                    f"{DETAILS_REGISTER_BTN}, {DETAILS_WAITLIST_BTN}, {DETAILS_EDIT_REGISTRATION_BTN}",
+                )
+                or self._header_opens_text(),
                 "the details page's Register/Edit Registration button or signup message",
                 timeout=hydrate,
             )
@@ -710,11 +703,35 @@ class Website:
 
     def _details_row_indexes(self):
         indexes = []
-        for element in self.driver.find_elements(By.CSS_SELECTOR, f"[data-testid^='{DETAILS_ROW_PREFIX}']"):
+        for element in self.driver.find_elements(By.CSS_SELECTOR, f"[data-testid^='{DETAILS_ROW_TIME_PREFIX}']"):
             match = DETAILS_ROW_ID_RE.match(element.get_attribute("data-testid") or "")
             if match:
                 indexes.append(int(match.group(1)))
         return sorted(indexes)
+
+    def _row_time_element(self, index):
+        elements = self.driver.find_elements(By.CSS_SELECTOR, DETAILS_ROW_TIME(index))
+        return elements[0] if elements else None
+
+    def _row_element(self, index):
+        """The row's container: the time's grandparent's parent (see the layout above)."""
+        time_element = self._row_time_element(index)
+        return time_element.find_element(By.XPATH, "../../..") if time_element is not None else None
+
+    def _row_date_text(self, index):
+        time_element = self._row_time_element(index)
+        if time_element is None:
+            return ""
+        try:
+            block = time_element.find_element(By.XPATH, "../../../*[1]")
+        except NoSuchElementException:
+            return ""
+        # One element per part (weekday / day / month): their textContent runs together.
+        parts = [
+            " ".join((part.get_attribute("textContent") or part.text or "").split())
+            for part in block.find_elements(By.XPATH, "./*")
+        ]
+        return " ".join(p for p in parts if p)
 
     def _details_rows(self):
         """Every date of the series on the details page, as plain data."""
@@ -724,7 +741,7 @@ class Website:
             rows.append(
                 {
                     "index": index,
-                    "month_day": _parse_row_month_day(self._text(DETAILS_ROW_DATE(index))),
+                    "month_day": _parse_row_month_day(self._row_date_text(index)),
                     "time": _parse_time_range(self._text(DETAILS_ROW_TIME(index))),
                     "slots": self._text(DETAILS_ROW_SLOTS(index)),
                     "not_open": not_open,
@@ -735,21 +752,45 @@ class Website:
         return rows
 
     def _has_registered_tag(self, index):
-        # The tag's text is checked, not just its presence: a waitlisted date
-        # (never seen on the live site) could well reuse the same slot.
+        # The tag has no test id: it's the time's sibling that has none.
+        # Its text is checked, not just its presence: a waitlisted date
+        # (never seen on the live site) could well reuse the same slot, and a
+        # full date carries a "Full" tag in the same place.
         # textContent first: Selenium's .text is "" for an element it doesn't
         # consider displayed (e.g. scrolled inside a hidden overflow).
         # A row re-rendering between the find and the read leaves a stale
         # element; one fresh find is enough to read the new one.
         for _attempt in range(2):
             try:
+                time_element = self._row_time_element(index)
+                if time_element is None:
+                    return False
                 return any(
                     (element.get_attribute("textContent") or element.text or "").strip().lower() == "registered"
-                    for element in self.driver.find_elements(By.CSS_SELECTOR, DETAILS_ROW_REGISTERED(index))
+                    for element in time_element.find_elements(By.XPATH, "../*[not(@data-testid)]")
                 )
             except StaleElementReferenceException:
                 continue
         return False
+
+    def _header_leaf_texts(self):
+        """Texts of the header's leaf elements (date, time, slots, countdown...), in order."""
+        cards = self.driver.find_elements(By.CSS_SELECTOR, DETAILS_CARD)
+        if not cards:
+            return []
+        texts = []
+        for leaf in cards[0].find_elements(By.XPATH, DETAILS_HEADER_LEAVES_XPATH):
+            text = " ".join((leaf.get_attribute("textContent") or leaf.text or "").split())
+            if text:
+                texts.append(text)
+        return texts
+
+    def _header_date_text(self):
+        return next((t for t in self._header_leaf_texts() if _parse_month_day(t)), None)
+
+    def _header_opens_text(self):
+        """The header's own "Registration opens in ..." countdown (not a row's "Single date ..." one)."""
+        return next((t for t in self._header_leaf_texts() if t.lower().startswith("registration opens")), None)
 
     def _appears_within(self, condition, what):
         """Whether `condition()` turns true within VERIFY_MARKUP_SECONDS
@@ -804,10 +845,11 @@ class Website:
 
     def _details_restriction(self):
         """Skill restriction text such as 'Intermediate, Advanced', or None."""
-        for element in self.driver.find_elements(By.CSS_SELECTOR, DETAILS_RESTRICTION):
+        for element in self.driver.find_elements(By.CSS_SELECTOR, DETAILS_SIDE):
             lines = [line.strip() for line in element.text.splitlines() if line.strip()]
-            if lines and "skill" in lines[0].lower():
-                return ", ".join(lines[1:]) or None
+            for i, line in enumerate(lines):
+                if "skill" in line.lower() and "restriction" in line.lower():
+                    return lines[i + 1] if i + 1 < len(lines) else None
         return None
 
     def _details_summary(self, card=None, restriction=None):
@@ -1165,10 +1207,10 @@ class Website:
     # --- registration ---------------------------------------------------------------
 
     def _header_month_day(self):
-        return _parse_month_day(self._text(DETAILS_HEADER_DATE) or "")
+        return _parse_month_day(self._header_date_text() or "")
 
     def _details_button_label(self, event_date, time_range):
-        label = (self._text(DETAILS_REGISTER_BTN) or "").lower()
+        label = (self._text(DETAILS_REGISTER_BTN) or self._text(DETAILS_WAITLIST_BTN) or "").lower()
         if not label and self._edit_registration_is_for(event_date, time_range):
             # The header date is already registered: the site shows Edit
             # Registration / Withdraw instead of a Register button. Withdraw
@@ -1202,7 +1244,9 @@ class Website:
         if self._header_month_day() == target:
             return
         for row in self._matching_rows(self._details_rows(), event_date, time_range):
-            element = self.driver.find_element(By.CSS_SELECTOR, DETAILS_ROW(row["index"]))
+            element = self._row_element(row["index"])
+            if element is None:
+                continue
             self.driver.execute_script("arguments[0].click();", element)
             try:
                 self._wait(
@@ -1214,7 +1258,7 @@ class Website:
             except TimeoutException:
                 break
         raise RegistrationError(
-            f"The details page shows {self._text(DETAILS_HEADER_DATE)!r}, not {event_date}, "
+            f"The details page shows {self._header_date_text()!r}, not {event_date}, "
             "and selecting that date didn't work"
         )
 
@@ -1259,7 +1303,7 @@ class Website:
                 )
             raise RegistrationNotOpen(
                 f"No Register button for {event_date} {time_range} (button: {label or 'none'}); "
-                f"registration may not be open. {self._text(DETAILS_SIGNUP_MESSAGE) or ''}".strip(),
+                f"registration may not be open. {self._header_opens_text() or ''}".strip(),
                 opens_in=opens_in,
             )
 
@@ -1334,7 +1378,7 @@ class Website:
             if row["opens_in"] is not None:
                 return row["opens_in"]
         if self._header_month_day() == target:
-            return _parse_opens_in(self._text(DETAILS_SIGNUP_MESSAGE))
+            return _parse_opens_in(self._header_opens_text())
         return None
 
     def _wait_for_opening(self, event_date, time_range, details_url):
@@ -1497,7 +1541,7 @@ class Website:
             message = (
                 f"Finalize Registration was clicked for {event_date} {time_range} but the result "
                 f"couldn't be checked: {description}; details page shows "
-                f"{self._text(DETAILS_HEADER_DATE)!r}"
+                f"{self._header_date_text()!r}"
             )
             if not left_signup:
                 raise RegistrationError(message)
