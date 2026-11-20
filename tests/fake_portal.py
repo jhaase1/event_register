@@ -32,6 +32,8 @@ class El:
         self.role = role
         self.click_error = click_error  # raised by a native click only
         self.displayed = displayed
+        self.parent = None
+        self.on_tag_read = None  # called when the row's tag siblings are read
 
     @property
     def text(self):
@@ -76,13 +78,50 @@ class El:
             yield from c.walk()
 
     def find_elements(self, by, selector):
+        if by == By.XPATH:
+            return self._xpath(selector)
         return _select([e for c in self.children for e in c.walk()], by, selector)
+
+    def _xpath(self, selector):
+        """The few relative paths website.py uses on details-page elements."""
+        if selector == "../../..":
+            return [self.parent.parent.parent]
+        if selector == "../../../*[1]":
+            return [self.parent.parent.parent.children[0]]
+        if selector == "./*":
+            return list(self.children)
+        if selector == "../*[not(@data-testid)]":
+            if self.on_tag_read:
+                self.on_tag_read()
+            return [c for c in self.parent.children if not c.testid]
+        if selector.startswith(".//*[not(*)]"):
+            # Header leaves: no children, outside the title and the dates tab.
+            leaves = []
+
+            def visit(el):
+                if el.tag_name == "h1" or el.testid == "events-details-tabs":
+                    return
+                if not el.children:
+                    leaves.append(el)
+                for c in el.children:
+                    visit(c)
+
+            for c in self.children:
+                visit(c)
+            return leaves
+        raise AssertionError(f"fake doesn't support xpath {selector}")
 
     def find_element(self, by, selector):
         found = self.find_elements(by, selector)
         if not found:
             raise NoSuchElementException(selector)
         return found[0]
+
+
+def _link(el):
+    for c in el.children:
+        c.parent = el
+        _link(c)
 
 
 def _matches(el, selector):
@@ -258,8 +297,6 @@ class FakePortal:
 
     def find_elements(self, by, selector):
         self.finds_since_load += 1
-        if selector.startswith("[data-testid='events-details-date-registered-"):
-            self.tag_reads_since_load += 1
         return _select(list(self._root().walk()), by, selector)
 
     def find_element(self, by, selector):
@@ -296,7 +333,9 @@ class FakePortal:
             children.append(self.dialog)
         if self.ineligible:
             children.append(El(text="You are not eligible to register for this event."))
-        return El(tag="body", children=children)
+        body = El(tag="body", children=children)
+        _link(body)
+        return body
 
     @staticmethod
     def _date_text(row):
@@ -368,6 +407,12 @@ class FakePortal:
             self.finds_since_load > s.registered_markup_delay_finds
             and (not s.registered_tag_hidden_reads or self.tag_reads_since_load > s.registered_tag_hidden_reads)
         )
+
+        def count_tag_read():
+            self.tag_reads_since_load += 1
+
+        # Row layout of the live site (Nov 2026): only the time, slots and
+        # not-open text carry test ids; the date block, tag and row don't.
         rows = []
         for i, row in enumerate(s.rows):
             def select(series=s, index=i):
@@ -379,53 +424,58 @@ class FakePortal:
                 if row.state == "not_open"
                 else El(testid=f"events-details-date-row-slots-{i}", text="FULL" if row.state == "full" else row.slots)
             )
-            row_children = [
-                El(testid=f"events-details-date-row-date-{i}",
-                   text=f"{row.weekday}\n{row.day}\n{MONTH_ABBR[row.month]}"),
-                El(testid=f"events-details-date-row-time-{i}", text=row.time_text),
-            ]
+            time_el = El(testid=f"events-details-date-row-time-{i}", text=row.time_text)
+            time_el.on_tag_read = count_tag_read
+            top = [time_el]
             if row.registered and s.registered_markup and settled:
-                # Live site (Nov 2026): a green "Registered" tag next to the time.
-                row_children.append(El(testid=f"events-details-date-registered-{i}", text=s.registered_tag_text,
-                                       displayed=s.registered_tag_displayed))
-            row_children.append(status)
-            rows.append(El(testid=f"events-details-date-row-{i}", on_click=select, children=row_children))
+                # A green "Registered" tag next to the time.
+                top.append(El(tag="span", text=s.registered_tag_text, displayed=s.registered_tag_displayed))
+            date_block = El(children=[
+                El(text=row.weekday), El(text=str(row.day)), El(text=MONTH_ABBR[row.month]),
+            ])
+            rows.append(El(on_click=select, children=[date_block, El(children=[El(children=top), status])]))
 
         def register(series=s):
             # Like the live site: Register only opens the signup page.
             self.get(f"https://x/Online/Events/SignUpToEvent/1?eventId={series.card_id}"
                      f"&reservationNumber={series.details_code}")
 
-        children = [
-            El(testid="events-details-page", children=[
-                El(testid="events-details-date", text=self._date_text(selected)),
-                El(testid="events-details-time", text=selected.time_text),
-                El(testid="events-details-slots", text=selected.slots),
-            ]),
+        header = [
+            El(tag="h1", text=s.name),
+            El(text=s.category),
+            El(tag="span", children=[El(text=self._date_text(selected))]),
+            El(tag="span", children=[El(text=selected.time_text)]),
+            El(tag="span", children=[El(text=selected.slots)]),
         ]
         if selected.state == "not_open":
-            children.append(El(testid="events-details-signup-message",
-                               text=selected.opens_in.replace("Single date registration", "Registration")))
+            header.append(El(tag="span", children=[
+                El(text=selected.opens_in.replace("Single date registration", "Registration"))]))
+        if selected.state == "not_open":
+            pass
         elif selected.registered and s.registered_markup and settled:
-            # Live site (Nov 2026): Register is replaced by these two buttons.
+            # Register is replaced by these two buttons.
             buttons = {
                 "edit": El(testid="events-details-edit-registration-btn edit-registration-btn",
                            text="Edit Registration", tag="button"),
                 "withdraw": El(testid="events-details-withdraw-btn withdraw-btn", text="Withdraw", tag="button"),
             }
-            children.append(El(testid="events-details-action-btns",
-                               children=[buttons[b] for b in s.registered_buttons]))
+            header.append(El(children=[buttons[b] for b in s.registered_buttons]))
         else:
             label = s.row_label(selected) if settled else "Register"
-            children.append(El(
-                testid="events-details-register-btn events-details-register-single-btn register-btn",
-                text=label, tag="button", on_click=register,
-                click_error=s.register_click_error,
-            ))
+            testid = (
+                "events-details-join-waitlist-btn join-waitlisted-btn"
+                if label.lower() == "join waitlist"
+                else "events-details-register-btn events-details-register-single-btn register-btn"
+            )
+            header.append(El(testid=testid, text=label, tag="button", on_click=register,
+                             click_error=s.register_click_error))
         if s.description:
-            children.append(El(testid="events-details-description", text=s.description))
-        children.append(El(testid="events-details-dates-list", children=rows))
+            header.append(El(testid="events-details-description", text=s.description))
+        header.append(El(testid="events-details-tabs", children=rows))
+        children = [El(testid=f"events-details-card-{s.card_id}", children=header)]
+        side = [El(testid="events-details-side-courts-value", text="Pickleball #1, Pickleball #2")]
         if s.restriction:
-            children.append(El(testid="events-details-side-restriction-0",
-                               children=[El(text="Skill Level Restriction"), El(text=s.restriction)]))
+            side += [El(text="Skill Level Restriction"), El(text=s.restriction)]
+        children.append(El(testid="events-details-side", children=side))
         return children
+
