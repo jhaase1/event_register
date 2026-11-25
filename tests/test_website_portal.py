@@ -413,6 +413,63 @@ def test_register_finalizes_on_the_signup_page_and_verifies():
     assert fake.gets[-1].startswith("https://x/Online/Events/Details/1/SERIES101")
 
 
+def test_register_finalizes_when_the_signup_date_still_has_its_test_id():
+    series = standard_series()
+    series[0].signup_date_testid = True
+    site, _fake = make_site(series)
+
+    site.register_for_event(req(D1), "11a - 1p", _details_url("SERIES101"))
+
+    assert series[0].rows[0].registered is True
+
+
+def test_register_finds_finalize_by_its_label_when_its_test_id_goes():
+    series = standard_series()
+    series[0].signup_submit_testid = False
+    site, _fake = make_site(series)
+
+    site.register_for_event(req(D1), "11a - 1p", _details_url("SERIES101"))
+
+    assert series[0].rows[0].registered is True
+
+
+def test_signup_date_without_test_ids_is_the_first_one_on_the_page():
+    # A later date further down (a policy, another session) isn't the signup's.
+    from fake_portal import El
+    series = standard_series()
+    site, fake = make_site(series)
+    original = fake._signup_page
+    fake._signup_page = lambda s: original(s) + [El(text=f"Cancel by {req(D2)}, 2026")]
+
+    site.register_for_event(req(D1), "11a - 1p", _details_url("SERIES101"))
+
+    assert series[0].rows[0].registered is True
+
+
+def test_signup_timeout_says_what_the_page_showed():
+    # A relabelled button or a changed page should be fixable from the report.
+    from fake_portal import El
+    series = standard_series()
+    site, fake = make_site(series)
+    original = fake._signup_page
+
+    def relabelled(s):
+        page = original(s)
+        page[-1] = El(tag="button", text="Complete Registration")
+        return page
+
+    fake._signup_page = relabelled
+
+    with pytest.raises(website.TimeoutException) as error:
+        site.register_for_event(req(D1), "11a - 1p", _details_url("SERIES101"))
+
+    message = str(error.value)
+    assert "Finalize Registration button" in message
+    assert "Complete Registration" in message
+    assert f"{D1:%b} {D1.day}" in message
+    assert series[0].rows[0].registered is False
+
+
 def test_register_raises_when_finalize_does_not_take_effect():
     series = standard_series()
     series[0].on_register = "nothing"

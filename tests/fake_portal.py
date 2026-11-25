@@ -153,6 +153,12 @@ def _select(elements, by, selector):
             e for e in elements
             if INELIGIBLE_MARK in (e._text or "").lower() and e.tag_name not in ("script", "style")
         ]
+    if by == By.XPATH and "finalize registration" in selector:
+        # Like normalize-space(.): the button's whole text, descendants included.
+        return [
+            e for e in elements
+            if e.tag_name == "button" and "finalize registration" in " ".join(e.text_content.split()).lower()
+        ]
     if by == By.XPATH and "events found" in selector:
         return [e for e in elements if re.search(r"events? found", e._text or "")]
     raise AssertionError(f"fake doesn't support {by} {selector}")
@@ -207,6 +213,10 @@ class Series:
         # leaving the page before then abandons the registration.
         self.finalize_spinner_seconds = None
         self.signup_script_text = None  # text inside a <script> on the signup page
+        # Which signup-page test ids are present. Live (Nov 24 2026): the
+        # Finalize button kept its test id, the header date lost its own.
+        self.signup_date_testid = False
+        self.signup_submit_testid = True
         # How the signup step behaves: 'register' (Finalize registers), 'nothing'
         # (Finalize has no effect), 'ineligible' (signup page says not eligible),
         # 'wrong_date' (signup page is for a different date).
@@ -382,13 +392,26 @@ class FakePortal:
                     self.get(f"https://x/Online/Events/Details/1/{series.details_code}?resId=1")
 
         s.signup_renders += 1
-        header = []
-        if s.signup_renders > s.signup_date_delay_renders:
-            header.append(El(testid="event-signup-header-date", text=f"{self._date_text(shown).replace('th', '').replace('st', '').replace('nd', '').replace('rd', '')}, 2026"))
-        children = [El(testid="event-signup-page", children=header + [
-            El(testid="event-signup-header-time", text=row.time_text),
-            El(testid="event-signup-total-due", text="$0.00"),
-        ])]
+        date_text = f"{self._date_text(shown).replace('th', '').replace('st', '').replace('nd', '').replace('rd', '')}, 2026"
+        date_shown = s.signup_renders > s.signup_date_delay_renders
+        # Layout of the live page (Nov 24 2026): site nav, then the event card
+        # (title, category, date, time, cost, spots) and an order summary
+        # repeating the date above the Finalize button.
+        nav = El(tag="header", children=[El(text="Events"), El(tag="a", text="Book a Court"), El(text="Member Name")])
+        card = [El(tag="h1", text=s.name), El(text=s.category)]
+        if date_shown:
+            card.append(El(testid="event-signup-header-date" if s.signup_date_testid else None, text=date_text))
+        card += [
+            El(text=row.time_text), El(text=s.cost), El(text=row.slots),
+            El(text="8 of 28 Players Registered"),
+            El(testid="event-signup-registrants-view-btn", tag="button", children=[El(tag="span", text="View")]),
+        ]
+        summary = [El(text=s.name), El(testid="event-signup-summary-event-category", text=s.category)]
+        if date_shown:
+            summary.append(El(tag="span", text=date_text))
+        summary += [El(tag="span", text=row.time_text), El(testid="event-signup-summary-heading", text="Order Summary"),
+                    El(text="Total Due"), El(tag="span", text="$0.00")]
+        children = [nav, El(tag="main", children=card), El(tag="aside", children=summary)]
         if s.signup_script_text:
             children.append(El(tag="script", text=s.signup_script_text))
         if self.pending and self.pending[0] is s:
@@ -396,8 +419,9 @@ class FakePortal:
         elif s.on_register == "ineligible":
             children.append(El(text="You are not eligible to register for this event."))
         else:
-            children.append(El(testid="event-signup-submit-btn", text="Finalize Registration", tag="button",
-                               on_click=finalize))
+            # The label sits in a span inside the button, like the live page.
+            children.append(El(testid="event-signup-submit-btn" if s.signup_submit_testid else None, tag="button",
+                               on_click=finalize, children=[El(tag="span", text="Finalize Registration")]))
         return children
 
     def _details_page(self, s):
