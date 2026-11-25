@@ -128,8 +128,22 @@ OPEN_LABELS = (LABEL_REGISTER, LABEL_WAITLIST) + REGISTERED_LABELS
 # Signup page the details-page Register button navigates to
 # (/Online/Events/SignUpToEvent/...). Nothing is registered until
 # "Finalize Registration" is clicked (verified on the live site, Nov 2026).
+# The header date lost its test id on Nov 24 2026 (it's a plain div now, and
+# a registration timed out waiting for it); the Finalize button kept its own.
+# The site has been dropping test ids page by page, so each is backed by its
+# text: the button by its label, the date by the page's first "weekday,
+# month day" (the event card's, above the order summary's copy).
 SIGNUP_DATE = _testid("event-signup-header-date")      # "Thu, Nov 12, 2026"
 SIGNUP_SUBMIT_BTN = _testid("event-signup-submit-btn")  # "Finalize Registration"
+SIGNUP_SUBMIT_XPATH = (
+    "//button[contains(translate(normalize-space(.), "
+    "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'finalize registration')]"
+)
+SIGNUP_DATE_RE = re.compile(
+    r"\b(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*\.?,?\s+"
+    r"(?P<date>[a-z]{3,9}\.?\s+\d{1,2}(?:st|nd|rd|th)?\b(?:,?\s+\d{4})?)",
+    re.IGNORECASE,
+)
 CONTINUE_BUTTON = "button[data-testid='Continue']"
 # Own text only (text(), not the whole subtree), and never script or style
 # contents, which can mention eligibility without the page saying so.
@@ -1427,9 +1441,44 @@ class Website:
         except WebDriverException:
             pass
         return bool(
-            self.driver.find_elements(By.CSS_SELECTOR, SIGNUP_DATE)
-            or self.driver.find_elements(By.CSS_SELECTOR, SIGNUP_SUBMIT_BTN)
+            self.driver.find_elements(By.CSS_SELECTOR, SIGNUP_DATE) or self._signup_submit_buttons()
         )
+
+    def _signup_submit_buttons(self):
+        """The signup page's Finalize Registration buttons: by test id, else by label."""
+        return self.driver.find_elements(By.CSS_SELECTOR, SIGNUP_SUBMIT_BTN) or self.driver.find_elements(
+            By.XPATH, SIGNUP_SUBMIT_XPATH
+        )
+
+    def _signup_date_text(self):
+        """The signup page's date: its test id'd header, else the first
+        "weekday, month day" in the page's text (the header is at the top)."""
+        text = self._text(SIGNUP_DATE)
+        if text:
+            return text
+        bodies = self.driver.find_elements(By.TAG_NAME, "body")
+        if not bodies:
+            return None
+        for match in SIGNUP_DATE_RE.finditer(bodies[0].text or ""):
+            if _parse_month_day(match.group("date")):
+                return " ".join(match.group(0).split())
+        return None
+
+    def _signup_page_summary(self):
+        """What the signup page shows, for a failure message: its date and
+        button labels. Never raises."""
+        try:
+            if not self._on_signup_page():
+                return "not on the signup page"
+            date = self._signup_date_text()
+            labels = [
+                " ".join((b.get_attribute("textContent") or b.text or "").split())
+                for b in self.driver.find_elements(By.TAG_NAME, "button")
+            ]
+            labels = [label for label in labels if label]
+            return f"signup page date: {date!r}; buttons: {labels[:15]}"
+        except Exception as e:
+            return f"couldn't read the signup page: {e!r}"
 
     def _ineligible_text(self):
         """Visible 'not eligible' text on the page, or None."""
@@ -1454,20 +1503,25 @@ class Website:
                 return False
             # The date is checked before finalizing, so wait for it too: it
             # can render after the button.
-            submit = [e for e in driver.find_elements(By.CSS_SELECTOR, SIGNUP_SUBMIT_BTN) if e.is_enabled()]
-            if submit and _parse_month_day(self._text(SIGNUP_DATE) or ""):
+            submit = [e for e in self._signup_submit_buttons() if e.is_enabled()]
+            if submit and _parse_month_day(self._signup_date_text() or ""):
                 return "ready", submit[0]
             ineligible = self._ineligible_text()
             if ineligible:
                 return "ineligible", ineligible
             return False
 
-        kind, found = self._wait(signup_page, "the signup page's Finalize Registration button")
+        try:
+            kind, found = self._wait(signup_page, "the signup page's Finalize Registration button")
+        except TimeoutException as e:
+            # Say what was there instead, so a changed page can be fixed from
+            # the report alone.
+            raise TimeoutException(f"{e.msg} - {self._signup_page_summary()}") from e
         if kind == "ineligible":
             raise RegistrationError(f"Cannot register for event: {found}")
 
         # Never finalize a different date than the one requested.
-        signup_date = self._text(SIGNUP_DATE)
+        signup_date = self._signup_date_text()
         if _parse_month_day(signup_date or "") != _parse_month_day(event_date or ""):
             raise RegistrationError(
                 f"Signup page is for {signup_date!r}, not {event_date}; not finalizing."
@@ -1490,7 +1544,7 @@ class Website:
             ineligible = self._ineligible_text()
             if ineligible and ineligible != stray_ineligible:
                 return "ineligible", ineligible
-            if driver.find_elements(By.CSS_SELECTOR, SIGNUP_SUBMIT_BTN):
+            if self._signup_submit_buttons():
                 submit_gone_since.clear()
                 return False
             if not submit_gone_since:
